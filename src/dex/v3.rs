@@ -57,7 +57,7 @@ pub async fn quote_v3(
     }
 }
 
-/// Try multiple V3 fee tiers and return the best quote
+/// Try multiple V3 fee tiers and return the best quote (batched via parallel execution)
 pub async fn quote_v3_multi_fee(
     rpc_url: &str,
     token_in: Address,
@@ -65,10 +65,22 @@ pub async fn quote_v3_multi_fee(
     amount_in: U256,
     fees: &[u32],
 ) -> Result<Option<QuoteResult>> {
-    let mut best_quote: Option<QuoteResult> = None;
+    // Execute all fee tier queries in parallel
+    let mut tasks = Vec::new();
 
     for &fee in fees {
-        if let Ok(quote) = quote_v3(rpc_url, token_in, token_out, amount_in, fee).await {
+        let rpc_url = rpc_url.to_string();
+        let task = tokio::spawn(async move {
+            quote_v3(&rpc_url, token_in, token_out, amount_in, fee).await
+        });
+        tasks.push(task);
+    }
+
+    // Collect results and find best quote
+    let mut best_quote: Option<QuoteResult> = None;
+
+    for task in tasks {
+        if let Ok(Ok(quote)) = task.await {
             if let Some(ref current_best) = best_quote {
                 if quote.amount_out > current_best.amount_out {
                     best_quote = Some(quote);

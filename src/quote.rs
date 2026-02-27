@@ -368,6 +368,55 @@ async fn try_route(
     Ok(None)
 }
 
+/// Get best V3 quote, using cache if available
+/// This is cache-aware unlike quote_v3_multi_fee which always tries all fees
+async fn get_best_v3_quote_cached(
+    rpc_url: &str,
+    token_in: Address,
+    token_out: Address,
+    amount: U256,
+) -> Result<Option<QuoteResult>> {
+    // Check cache for this pair
+    let refresh_interval = cache_refresh_interval();
+    let cached_routes = cache::get_cached_routes(token_in, token_out, refresh_interval)
+        .ok()
+        .flatten();
+
+    // If we have cached routes, try only the cached V3 fees
+    if let Some(route_cache) = cached_routes {
+        let mut best_quote: Option<QuoteResult> = None;
+
+        for cached_route in &route_cache.routes {
+            // Only process V3 direct routes
+            if cached_route.method.starts_with("v3-direct(") {
+                if let Some(fee_str) = cached_route.method
+                    .strip_prefix("v3-direct(")
+                    .and_then(|s| s.strip_suffix(")"))
+                {
+                    if let Ok(fee) = fee_str.parse::<u32>() {
+                        if let Ok(quote) = dex::quote_v3(rpc_url, token_in, token_out, amount, fee).await {
+                            if let Some(ref current_best) = best_quote {
+                                if quote.amount_out > current_best.amount_out {
+                                    best_quote = Some(quote);
+                                }
+                            } else {
+                                best_quote = Some(quote);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if best_quote.is_some() {
+            return Ok(best_quote);
+        }
+    }
+
+    // Cache miss or no V3 routes in cache - try all fee tiers
+    dex::quote_v3_multi_fee(rpc_url, token_in, token_out, amount, V3_FEES).await
+}
+
 /// Try V3 via WETH: token_in -> WETH -> token_out
 async fn try_v3_via_weth(
     rpc_url: &str,
@@ -377,17 +426,16 @@ async fn try_v3_via_weth(
 ) -> Result<Option<QuoteResult>> {
     let weth_addr: Address = WETH.parse()?;
 
-    // token_in -> WETH
+    // token_in -> WETH (cache-aware)
     if let Ok(Some(weth_quote)) =
-        dex::quote_v3_multi_fee(rpc_url, token_in, weth_addr, amount, V3_FEES).await
+        get_best_v3_quote_cached(rpc_url, token_in, weth_addr, amount).await
     {
-        // WETH -> token_out
-        if let Ok(Some(out_quote)) = dex::quote_v3_multi_fee(
+        // WETH -> token_out (cache-aware)
+        if let Ok(Some(out_quote)) = get_best_v3_quote_cached(
             rpc_url,
             weth_addr,
             token_out,
             weth_quote.amount_out,
-            V3_FEES,
         )
         .await
         {
@@ -465,51 +513,88 @@ async fn try_all_routes(
     let weth_addr: Address = WETH.parse()?;
     let mut quotes = Vec::new();
 
-    // 1. Try V4 direct (token_in -> token_out)
-    if let Some(pool_info) = dex::discover_v4_pool_key(rpc_url, token_in, token_out).await? {
-        if let Ok(v4_quote) = dex::quote_v4(rpc_url, token_in, amount, &pool_info).await {
-            quotes.push(v4_quote);
-        }
-    }
-
-    // 2. Try V4 multi-hop routes using DexScreener-discovered quote tokens and pool IDs
     // Get all V4 routing info (quote tokens + pool IDs + block hints) for this token from DexScreener
     let v4_routes = get_v4_routing_info(rpc_url, token_in).await;
 
+    // Build all route tasks to run in parallel
+    let mut route_tasks: Vec<tokio::task::JoinHandle<Vec<QuoteResult>>> = Vec::new();
+
+    // 1. V4 direct (token_in -> token_out)
+    let rpc_url_clone = rpc_url.to_string();
+    route_tasks.push(tokio::spawn(async move {
+        if let Ok(Some(pool_info)) = dex::discover_v4_pool_key(&rpc_url_clone, token_in, token_out).await {
+            if let Ok(v4_quote) = dex::quote_v4(&rpc_url_clone, token_in, amount, &pool_info).await {
+                return vec![v4_quote];
+            }
+        }
+        vec![]
+    }));
+
+    // 2. V4 multi-hop routes (all in parallel)
     for (intermediate, pool_id, creation_block) in v4_routes {
         // Skip if intermediate is the same as output
         if intermediate == token_out {
             continue;
         }
 
-        // Try token_in -> intermediate via V4 with target pool ID and creation block hint
-        if let Some(pool_info) = dex::v4::discover_v4_pool_key_with_target(
-            rpc_url,
-            token_in,
-            intermediate,
-            pool_id,
-            creation_block,
-        )
-        .await?
-        {
-            if let Ok(v4_quote) = dex::quote_v4(rpc_url, token_in, amount, &pool_info).await {
-                let intermediate_symbol = if intermediate == weth_addr {
-                    "weth"
-                } else if intermediate == FLETH.parse().unwrap_or(Address::ZERO) {
-                    "fleth"
-                } else {
-                    "token"
-                };
+        let rpc_url_clone = rpc_url.to_string();
+        route_tasks.push(tokio::spawn(async move {
+            let mut results = Vec::new();
 
-                // Try intermediate -> token_out via V4
-                if let Some(out_pool) =
-                    dex::discover_v4_pool_key(rpc_url, intermediate, token_out).await?
-                {
-                    if let Ok(final_quote) =
-                        dex::quote_v4(rpc_url, intermediate, v4_quote.amount_out, &out_pool).await
-                    {
-                        // Include both V4 pool params in method for caching
-                        quotes.push(QuoteResult {
+            // Try token_in -> intermediate via V4
+            if let Ok(Some(pool_info)) = dex::v4::discover_v4_pool_key_with_target(
+                &rpc_url_clone,
+                token_in,
+                intermediate,
+                pool_id,
+                creation_block,
+            )
+            .await
+            {
+                if let Ok(v4_quote) = dex::quote_v4(&rpc_url_clone, token_in, amount, &pool_info).await {
+                    let intermediate_symbol = if intermediate == weth_addr {
+                        "weth"
+                    } else if intermediate == FLETH.parse().unwrap_or(Address::ZERO) {
+                        "fleth"
+                    } else {
+                        "token"
+                    };
+
+                    // Try both second legs in parallel
+                    let rpc1 = rpc_url_clone.clone();
+                    let rpc2 = rpc_url_clone.clone();
+                    let v4_out_amount = v4_quote.amount_out;
+
+                    let (v4_v4_result, v4_v3_result) = tokio::join!(
+                        // V4 -> V4
+                        async {
+                            if let Ok(Some(out_pool)) =
+                                dex::discover_v4_pool_key(&rpc1, intermediate, token_out).await
+                            {
+                                if let Ok(final_quote) =
+                                    dex::quote_v4(&rpc1, intermediate, v4_out_amount, &out_pool).await
+                                {
+                                    return Some((out_pool, final_quote));
+                                }
+                            }
+                            None
+                        },
+                        // V4 -> V3
+                        async {
+                            if let Ok(Some(out_quote)) =
+                                get_best_v3_quote_cached(&rpc2, intermediate, token_out, v4_out_amount).await
+                            {
+                                // Cache intermediate leg
+                                let _ = cache::cache_routes(intermediate, token_out, &[out_quote.clone()]);
+                                return Some(out_quote);
+                            }
+                            None
+                        }
+                    );
+
+                    // Add V4->V4 result
+                    if let Some((out_pool, final_quote)) = v4_v4_result {
+                        results.push(QuoteResult {
                             method: format!(
                                 "v4-{}-v4({},{},{},{},{},{})",
                                 intermediate_symbol,
@@ -524,51 +609,63 @@ async fn try_all_routes(
                             gas_estimate: None,
                         });
                     }
-                }
 
-                // Try intermediate -> token_out via V3
-                if let Ok(Some(out_quote)) = dex::quote_v3_multi_fee(
-                    rpc_url,
-                    intermediate,
-                    token_out,
-                    v4_quote.amount_out,
-                    V3_FEES,
-                )
-                .await
-                {
-                    // Include V4 pool params and V3 fee in method for caching
-                    quotes.push(QuoteResult {
-                        method: format!(
-                            "v4-{}-v3({},{},{},{})",
-                            intermediate_symbol,
-                            pool_info.pool_key.fee,
-                            pool_info.pool_key.tick_spacing,
-                            pool_info.pool_key.hooks,
-                            out_quote.method.strip_prefix("v3-direct(").and_then(|s| s.strip_suffix(")")).unwrap_or("3000")
-                        ),
-                        amount_out: out_quote.amount_out,
-                        gas_estimate: None,
-                    });
+                    // Add V4->V3 result
+                    if let Some(out_quote) = v4_v3_result {
+                        results.push(QuoteResult {
+                            method: format!(
+                                "v4-{}-v3({},{},{},{})",
+                                intermediate_symbol,
+                                pool_info.pool_key.fee,
+                                pool_info.pool_key.tick_spacing,
+                                pool_info.pool_key.hooks,
+                                out_quote.method.strip_prefix("v3-direct(").and_then(|s| s.strip_suffix(")")).unwrap_or("3000")
+                            ),
+                            amount_out: out_quote.amount_out,
+                            gas_estimate: None,
+                        });
+                    }
                 }
             }
+
+            results
+        }));
+    }
+
+    // 3. V3 direct
+    let rpc_url_clone = rpc_url.to_string();
+    route_tasks.push(tokio::spawn(async move {
+        if let Ok(Some(quote)) =
+            dex::quote_v3_multi_fee(&rpc_url_clone, token_in, token_out, amount, V3_FEES).await
+        {
+            return vec![quote];
         }
-    }
+        vec![]
+    }));
 
-    // 5. Try V3 direct
-    if let Ok(Some(quote)) =
-        dex::quote_v3_multi_fee(rpc_url, token_in, token_out, amount, V3_FEES).await
-    {
-        quotes.push(quote);
-    }
+    // 4. V3 via WETH
+    let rpc_url_clone = rpc_url.to_string();
+    route_tasks.push(tokio::spawn(async move {
+        if let Ok(Some(quote)) = try_v3_via_weth(&rpc_url_clone, token_in, token_out, amount).await {
+            return vec![quote];
+        }
+        vec![]
+    }));
 
-    // 6. Try V3 via WETH
-    if let Ok(Some(quote)) = try_v3_via_weth(rpc_url, token_in, token_out, amount).await {
-        quotes.push(quote);
-    }
+    // 5. Aerodrome direct
+    let rpc_url_clone = rpc_url.to_string();
+    route_tasks.push(tokio::spawn(async move {
+        if let Ok(Some(quote)) = dex::quote_aerodrome_best(&rpc_url_clone, token_in, token_out, amount).await {
+            return vec![quote];
+        }
+        vec![]
+    }));
 
-    // 7. Try Aerodrome direct
-    if let Ok(Some(quote)) = dex::quote_aerodrome_best(rpc_url, token_in, token_out, amount).await {
-        quotes.push(quote);
+    // Wait for all tasks to complete and collect results
+    for task in route_tasks {
+        if let Ok(results) = task.await {
+            quotes.extend(results);
+        }
     }
 
     Ok(quotes)

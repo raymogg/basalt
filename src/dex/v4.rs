@@ -204,6 +204,8 @@ pub async fn discover_v4_pool_key_with_target(
     };
 
     // Try each fee/tickSpacing/hooks combination
+    // Note: Not parallelized as we want to return immediately upon first match
+    // and most successful lookups hit early in the iteration
     for &(fee, tick_spacing) in V4_FEE_TICK_COMBOS {
         for &hooks_str in CLANKER_HOOKS {
             let hooks: Address = hooks_str.parse()?;

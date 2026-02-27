@@ -46,6 +46,15 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize tracing for connection pool debugging
+    // Set RUST_LOG=hyper=debug,reqwest=debug to see connection pool activity
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"))
+        )
+        .init();
+
     // Load .env file if it exists (silently ignore if not found)
     let _ = dotenvy::dotenv();
 

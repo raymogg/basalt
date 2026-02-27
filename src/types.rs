@@ -78,3 +78,21 @@ pub struct TokenRegistry {
     pub name: String,
     pub cached_at: u64,
 }
+
+// V4 Pool Registry - stores all known valid V4 pools
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V4PoolRegistry {
+    // Key: "token0_token1" (sorted), Value: pool parameters
+    pub pools: std::collections::HashMap<String, V4PoolKeyData>,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V4PoolKeyData {
+    pub currency0: String, // Address as string
+    pub currency1: String, // Address as string
+    pub fee: u32,
+    pub tick_spacing: i32,
+    pub hooks: String, // Address as string
+    pub discovered_at: u64,
+}

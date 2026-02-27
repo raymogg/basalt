@@ -1,4 +1,4 @@
-use crate::types::{CachedRoute, RouteCache, TokenMetadata, TokenRegistry};
+use crate::types::{CachedRoute, RouteCache, TokenMetadata, TokenRegistry, V4PoolRegistry, V4PoolKeyData};
 use alloy::primitives::Address;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -259,5 +259,109 @@ pub fn get_cached_pool(key: &str) -> Option<crate::types::V4PoolInfo> {
 /// Cache V4 pool info
 pub fn cache_pool(key: String, pool_info: crate::types::V4PoolInfo) {
     let mut cache = pool_key_cache().lock().unwrap();
-    cache.insert(key, pool_info);
+    cache.insert(key.clone(), pool_info.clone());
+
+    // Also add to persistent global registry
+    let _ = add_to_v4_pool_registry(&pool_info.pool_key);
+}
+
+// ============================================================================
+// V4 Pool Registry (Persistent Global Pool Cache)
+// ============================================================================
+
+/// Load V4 pool registry from disk
+pub fn load_v4_pool_registry() -> Result<V4PoolRegistry> {
+    let path = cache_dir()?.join("v4-pool-registry.json");
+    if !path.exists() {
+        return Ok(V4PoolRegistry {
+            pools: HashMap::new(),
+            updated_at: now(),
+        });
+    }
+
+    let contents = fs::read_to_string(path)?;
+    let registry: V4PoolRegistry = serde_json::from_str(&contents)?;
+    Ok(registry)
+}
+
+/// Save V4 pool registry to disk
+fn save_v4_pool_registry(registry: &V4PoolRegistry) -> Result<()> {
+    let path = cache_dir()?.join("v4-pool-registry.json");
+    let json = serde_json::to_string_pretty(registry)?;
+    fs::write(path, json)?;
+    Ok(())
+}
+
+/// Add a pool to the V4 registry
+pub fn add_to_v4_pool_registry(pool_key: &crate::types::V4PoolKey) -> Result<()> {
+    let mut registry = load_v4_pool_registry()?;
+
+    // Create sorted key for lookup
+    let (addr0, addr1) = if pool_key.currency0 < pool_key.currency1 {
+        (pool_key.currency0, pool_key.currency1)
+    } else {
+        (pool_key.currency1, pool_key.currency0)
+    };
+    let key = format!("{}_{}_{}_{}_{}",
+        addr0.to_string().to_lowercase(),
+        addr1.to_string().to_lowercase(),
+        pool_key.fee,
+        pool_key.tick_spacing,
+        pool_key.hooks.to_string().to_lowercase()
+    );
+
+    // Add if not already present
+    if !registry.pools.contains_key(&key) {
+        registry.pools.insert(key, V4PoolKeyData {
+            currency0: pool_key.currency0.to_string(),
+            currency1: pool_key.currency1.to_string(),
+            fee: pool_key.fee,
+            tick_spacing: pool_key.tick_spacing,
+            hooks: pool_key.hooks.to_string(),
+            discovered_at: now(),
+        });
+        registry.updated_at = now();
+        save_v4_pool_registry(&registry)?;
+    }
+
+    Ok(())
+}
+
+/// Get all known V4 pools for a token pair
+pub fn get_v4_pools_for_pair(token_a: Address, token_b: Address) -> Result<Vec<crate::types::V4PoolKey>> {
+    let registry = load_v4_pool_registry()?;
+    let mut pools = Vec::new();
+
+    // Sort addresses for lookup
+    let (addr0, addr1) = if token_a < token_b {
+        (token_a, token_b)
+    } else {
+        (token_b, token_a)
+    };
+
+    let prefix = format!("{}_{}_",
+        addr0.to_string().to_lowercase(),
+        addr1.to_string().to_lowercase()
+    );
+
+    // Find all pools matching this pair
+    for (key, pool_data) in &registry.pools {
+        if key.starts_with(&prefix) {
+            if let (Ok(c0), Ok(c1), Ok(hooks)) = (
+                pool_data.currency0.parse(),
+                pool_data.currency1.parse(),
+                pool_data.hooks.parse(),
+            ) {
+                pools.push(crate::types::V4PoolKey {
+                    currency0: c0,
+                    currency1: c1,
+                    fee: pool_data.fee,
+                    tick_spacing: pool_data.tick_spacing,
+                    hooks,
+                });
+            }
+        }
+    }
+
+    Ok(pools)
 }

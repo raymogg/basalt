@@ -192,9 +192,6 @@ pub async fn discover_v4_pool_key_with_target(
         }
     }
 
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
-    let state_view = IStateView::new(V4_STATE_VIEW.parse()?, provider);
-
     // Sort currencies (V4 requires currency0 < currency1)
     let zero_for_one = token_address < quote_token;
     let (currency0, currency1) = if zero_for_one {
@@ -203,21 +200,11 @@ pub async fn discover_v4_pool_key_with_target(
         (quote_token, token_address)
     };
 
-    // Try each fee/tickSpacing/hooks combination
-    // Note: Not parallelized as we want to return immediately upon first match
-    // and most successful lookups hit early in the iteration
-    for &(fee, tick_spacing) in V4_FEE_TICK_COMBOS {
-        for &hooks_str in CLANKER_HOOKS {
-            let hooks: Address = hooks_str.parse()?;
+    // First check the V4 pool registry for known pools
+    let mut pool_candidates = Vec::new();
 
-            let pool_key = V4PoolKey {
-                currency0,
-                currency1,
-                fee,
-                tick_spacing,
-                hooks,
-            };
-
+    if let Ok(known_pools) = cache::get_v4_pools_for_pair(token_address, quote_token) {
+        for pool_key in known_pools {
             let pool_id = compute_pool_id(&pool_key);
 
             // If target_pool_id is specified, skip if this doesn't match
@@ -226,6 +213,44 @@ pub async fn discover_v4_pool_key_with_target(
                     continue;
                 }
             }
+
+            pool_candidates.push((pool_key, pool_id));
+        }
+    }
+
+    // If no known pools found in registry, build all possible combinations for brute-force
+    if pool_candidates.is_empty() {
+        for &(fee, tick_spacing) in V4_FEE_TICK_COMBOS {
+            for &hooks_str in CLANKER_HOOKS {
+                let hooks: Address = hooks_str.parse()?;
+                let pool_key = V4PoolKey {
+                    currency0,
+                    currency1,
+                    fee,
+                    tick_spacing,
+                    hooks,
+                };
+                let pool_id = compute_pool_id(&pool_key);
+
+                // If target_pool_id is specified, skip if this doesn't match
+                if let Some(target) = target_pool_id {
+                    if pool_id != target {
+                        continue;
+                    }
+                }
+
+                pool_candidates.push((pool_key, pool_id));
+            }
+        }
+    }
+
+    // Check all candidates in parallel
+    let mut tasks = Vec::new();
+    for (pool_key, pool_id) in pool_candidates {
+        let rpc_url = rpc_url.to_string();
+        let task = tokio::spawn(async move {
+            let provider = ProviderBuilder::new().on_http(rpc_url.parse().ok()?);
+            let state_view = IStateView::new(V4_STATE_VIEW.parse().ok()?, provider);
 
             // Try to get slot0 - if it succeeds and sqrtPriceX96 > 0, pool exists
             match state_view.getSlot0(pool_id.into()).call().await {
@@ -239,22 +264,31 @@ pub async fn discover_v4_pool_key_with_target(
                             .map(|l| l.liquidity)
                             .unwrap_or(0);
 
-                        let pool_info = V4PoolInfo {
-                            pool_key,
-                            pool_id,
-                            sqrt_price_x96: slot0.sqrtPriceX96,
-                            liquidity,
-                            zero_for_one,
-                        };
-
-                        // Cache for future use
-                        cache::cache_pool(cache_key.clone(), pool_info.clone());
-
-                        return Ok(Some(pool_info));
+                        return Some((pool_key, pool_id, slot0.sqrtPriceX96, liquidity));
                     }
                 }
-                Err(_) => continue, // Pool doesn't exist with this config
+                Err(_) => {}
             }
+            None
+        });
+        tasks.push(task);
+    }
+
+    // Wait for all tasks and return first successful match
+    for task in tasks {
+        if let Ok(Some((pool_key, pool_id, sqrt_price_x96, liquidity))) = task.await {
+            let pool_info = V4PoolInfo {
+                pool_key,
+                pool_id,
+                sqrt_price_x96,
+                liquidity,
+                zero_for_one,
+            };
+
+            // Cache for future use
+            cache::cache_pool(cache_key.clone(), pool_info.clone());
+
+            return Ok(Some(pool_info));
         }
     }
 

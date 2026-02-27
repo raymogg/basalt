@@ -21,11 +21,14 @@ pub async fn get_quote(
     amount_in: U256,
     decimals_in: u8,
 ) -> Result<FullQuoteResult> {
+    let start = std::time::Instant::now();
     let rpc_url = get_base_rpc();
 
     // Get token metadata
+    let meta_start = std::time::Instant::now();
     let token_in_meta = dex::get_token_metadata(&rpc_url, token_in).await?;
     let token_out_meta = dex::get_token_metadata(&rpc_url, token_out).await?;
+    eprintln!("[TIMING] Token metadata: {:?}", meta_start.elapsed());
 
     if amount_in == U256::ZERO {
         return Ok(FullQuoteResult {
@@ -66,7 +69,9 @@ pub async fn get_quote(
 
     // If cache miss or periodic refresh, do full fan-out
     if needs_full_refresh {
+        let routes_start = std::time::Instant::now();
         quotes = try_all_routes(&rpc_url, token_in, token_out, amount_in).await?;
+        eprintln!("[TIMING] try_all_routes: {:?}", routes_start.elapsed());
 
         // Cache the top routes (within 0.5% of best, max 3)
         let _ = cache::cache_routes(token_in, token_out, &quotes);
@@ -513,8 +518,10 @@ async fn try_all_routes(
     let weth_addr: Address = WETH.parse()?;
     let mut quotes = Vec::new();
 
-    // Get all V4 routing info (quote tokens + pool IDs + block hints) for this token from DexScreener
+    // Get all V4 routing info (quote tokens + pool IDs + block hints) from DexScreener
+    let dex_start = std::time::Instant::now();
     let v4_routes = get_v4_routing_info(rpc_url, token_in).await;
+    eprintln!("[TIMING]   - get_v4_routing_info (DexScreener): {:?}", dex_start.elapsed());
 
     // Build all route tasks to run in parallel
     let mut route_tasks: Vec<tokio::task::JoinHandle<Vec<QuoteResult>>> = Vec::new();
@@ -662,11 +669,14 @@ async fn try_all_routes(
     }));
 
     // Wait for all tasks to complete and collect results
+    let wait_start = std::time::Instant::now();
+    eprintln!("[TIMING]   - Spawned {} parallel route tasks", route_tasks.len());
     for task in route_tasks {
         if let Ok(results) = task.await {
             quotes.extend(results);
         }
     }
+    eprintln!("[TIMING]   - Parallel route execution: {:?}", wait_start.elapsed());
 
     Ok(quotes)
 }

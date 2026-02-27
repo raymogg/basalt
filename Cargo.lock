@@ -1034,6 +1034,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dotenvy",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",

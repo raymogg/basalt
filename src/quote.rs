@@ -304,7 +304,7 @@ async fn with_timeout<T>(
     tokio::time::timeout(duration, future).await.ok()
 }
 
-/// Try all routes in parallel and return all successful quotes
+/// Try all routes in PARALLEL and return all successful quotes
 async fn try_all_routes(
     rpc_url: &str,
     token_in: Address,
@@ -312,110 +312,144 @@ async fn try_all_routes(
     amount: U256,
 ) -> Result<Vec<QuoteResult>> {
     let weth_addr: Address = WETH.parse()?;
-    let mut quotes = Vec::new();
-    let route_timeout = std::time::Duration::from_secs(8);
+    let fleth_addr: Address = FLETH.parse()?;
+    let route_timeout = std::time::Duration::from_secs(10);
 
-    // 1. Try V4 direct (token_in -> token_out) with timeout
-    if let Some(Ok(Some(pool_info))) = with_timeout(route_timeout,
-        dex::discover_v4_pool_key(rpc_url, token_in, token_out)
-    ).await {
-        if let Ok(v4_quote) = dex::quote_v4(rpc_url, token_in, amount, &pool_info).await {
-            quotes.push(v4_quote);
+    // Phase 1: Run V4 discovery + DexScreener + simple routes ALL in parallel
+    let v4_direct_fut = with_timeout(route_timeout,
+        dex::discover_v4_pool_key(rpc_url, token_in, token_out));
+
+    let dexscreener_fut = with_timeout(
+        std::time::Duration::from_secs(5),
+        get_v4_routing_info(rpc_url, token_in));
+
+    let v3_direct_fut = with_timeout(route_timeout,
+        dex::quote_v3_multi_fee(rpc_url, token_in, token_out, amount, V3_FEES));
+
+    let v3_weth_fut = with_timeout(route_timeout,
+        try_v3_via_weth(rpc_url, token_in, token_out, amount));
+
+    let aero_fut = with_timeout(route_timeout,
+        dex::quote_aerodrome_best(rpc_url, token_in, token_out, amount));
+
+    // V4 via known intermediates (WETH, flETH) — discover pools in parallel too
+    let v4_weth_fut = with_timeout(route_timeout,
+        dex::discover_v4_pool_key(rpc_url, token_in, weth_addr));
+    let v4_fleth_fut = with_timeout(route_timeout,
+        dex::discover_v4_pool_key(rpc_url, token_in, fleth_addr));
+
+    // Run everything at once
+    let (v4_direct, dex_routes, v3_direct, v3_weth, aero, v4_weth_pool, v4_fleth_pool) =
+        tokio::join!(
+            v4_direct_fut,
+            dexscreener_fut,
+            v3_direct_fut,
+            v3_weth_fut,
+            aero_fut,
+            v4_weth_fut,
+            v4_fleth_fut,
+        );
+
+    let mut quotes = Vec::new();
+
+    // Collect V3/Aero results
+    if let Some(Ok(Some(q))) = v3_direct { quotes.push(q); }
+    if let Some(Ok(Some(q))) = v3_weth { quotes.push(q); }
+    if let Some(Ok(Some(q))) = aero { quotes.push(q); }
+
+    // V4 direct quote
+    if let Some(Ok(Some(pool_info))) = v4_direct {
+        if let Ok(q) = dex::quote_v4(rpc_url, token_in, amount, &pool_info).await {
+            quotes.push(q);
         }
     }
 
-    // 2. Try V4 multi-hop routes using DexScreener-discovered quote tokens and pool IDs
-    let v4_routes = if let Some(routes) = with_timeout(
-        std::time::Duration::from_secs(5),
-        get_v4_routing_info(rpc_url, token_in),
-    ).await {
-        routes
-    } else {
-        // Fallback: just WETH and flETH
-        let weth: Address = WETH.parse()?;
-        let fleth: Address = FLETH.parse()?;
-        vec![(weth, None, None), (fleth, None, None)]
-    };
+    // Phase 2: V4 multi-hop via discovered pools (WETH, flETH, DexScreener routes)
+    // Collect intermediate pool discoveries
+    let mut intermediate_pools: Vec<(Address, &str, Option<crate::types::V4PoolInfo>)> = Vec::new();
 
-    for (intermediate, pool_id, creation_block) in v4_routes {
-        if intermediate == token_out {
+    if let Some(Ok(pool)) = v4_weth_pool {
+        intermediate_pools.push((weth_addr, "weth", pool));
+    }
+    if let Some(Ok(pool)) = v4_fleth_pool {
+        intermediate_pools.push((fleth_addr, "fleth", pool));
+    }
+
+    // DexScreener-discovered routes that aren't WETH/flETH — discover in parallel
+    let dex_route_list = dex_routes.unwrap_or_default();
+    let mut extra_discovery_futs = Vec::new();
+    for (intermediate, pool_id, creation_block) in &dex_route_list {
+        if *intermediate == token_out || *intermediate == weth_addr || *intermediate == fleth_addr {
             continue;
         }
-
-        let discovery_result = with_timeout(route_timeout,
+        extra_discovery_futs.push(with_timeout(route_timeout,
             dex::v4::discover_v4_pool_key_with_target(
-                rpc_url,
-                token_in,
-                intermediate,
-                pool_id,
-                creation_block,
+                rpc_url, token_in, *intermediate,
+                *pool_id, *creation_block,
             )
-        ).await;
+        ));
+    }
+    let extra_results = futures::future::join_all(extra_discovery_futs).await;
+    let mut extra_idx = 0;
+    for (intermediate, _pool_id, _creation_block) in &dex_route_list {
+        if *intermediate == token_out || *intermediate == weth_addr || *intermediate == fleth_addr {
+            continue;
+        }
+        if let Some(Some(Ok(pool))) = extra_results.get(extra_idx) {
+            intermediate_pools.push((*intermediate, "token", pool.clone()));
+        }
+        extra_idx += 1;
+    }
 
-        if let Some(Ok(Some(pool_info))) = discovery_result {
-            if let Ok(v4_quote) = dex::quote_v4(rpc_url, token_in, amount, &pool_info).await {
-                let intermediate_symbol = if intermediate == weth_addr {
-                    "weth"
-                } else if intermediate == FLETH.parse().unwrap_or(Address::ZERO) {
-                    "fleth"
-                } else {
-                    "token"
-                };
+    // Quote through each intermediate in parallel
+    let mut hop_futs = Vec::new();
+    for (intermediate, label, pool_opt) in &intermediate_pools {
+        if let Some(pool_info) = pool_opt {
+            let rpc = rpc_url.to_string();
+            let ti = token_in;
+            let to = token_out;
+            let amt = amount;
+            let pi = pool_info.clone();
+            let im = *intermediate;
+            let lbl = label.to_string();
+            let wa = weth_addr;
 
-                // Try intermediate -> token_out via V4
-                if let Some(Ok(Some(out_pool))) = with_timeout(route_timeout,
-                    dex::discover_v4_pool_key(rpc_url, intermediate, token_out)
-                ).await {
-                    if let Ok(final_quote) =
-                        dex::quote_v4(rpc_url, intermediate, v4_quote.amount_out, &out_pool).await
-                    {
-                        quotes.push(QuoteResult {
-                            method: format!("v4-{}-v4", intermediate_symbol),
-                            amount_out: final_quote.amount_out,
+            hop_futs.push(tokio::spawn(async move {
+                let mut results = Vec::new();
+                if let Ok(v4_quote) = dex::quote_v4(&rpc, ti, amt, &pi).await {
+                    // Try V3 second leg
+                    if let Ok(Some(out)) = dex::quote_v3_multi_fee(
+                        &rpc, im, to, v4_quote.amount_out, V3_FEES,
+                    ).await {
+                        results.push(QuoteResult {
+                            method: format!("v4-{}-v3", lbl),
+                            amount_out: out.amount_out,
                             gas_estimate: None,
                         });
                     }
+                    // Try V4 second leg (only for WETH)
+                    if im == wa {
+                        if let Ok(Some(out_pool)) = dex::discover_v4_pool_key(&rpc, im, to).await {
+                            if let Ok(final_q) = dex::quote_v4(&rpc, im, v4_quote.amount_out, &out_pool).await {
+                                results.push(QuoteResult {
+                                    method: format!("v4-{}-v4", lbl),
+                                    amount_out: final_q.amount_out,
+                                    gas_estimate: None,
+                                });
+                            }
+                        }
+                    }
                 }
-
-                // Try intermediate -> token_out via V3
-                if let Some(Ok(Some(out_quote))) = with_timeout(route_timeout,
-                    dex::quote_v3_multi_fee(
-                        rpc_url,
-                        intermediate,
-                        token_out,
-                        v4_quote.amount_out,
-                        V3_FEES,
-                    )
-                ).await {
-                    quotes.push(QuoteResult {
-                        method: format!("v4-{}-v3", intermediate_symbol),
-                        amount_out: out_quote.amount_out,
-                        gas_estimate: None,
-                    });
-                }
-            }
+                results
+            }));
         }
     }
 
-    // 5. Try V3 direct
-    if let Some(Ok(Some(quote))) = with_timeout(route_timeout,
-        dex::quote_v3_multi_fee(rpc_url, token_in, token_out, amount, V3_FEES)
-    ).await {
-        quotes.push(quote);
-    }
-
-    // 6. Try V3 via WETH
-    if let Some(Ok(Some(quote))) = with_timeout(route_timeout,
-        try_v3_via_weth(rpc_url, token_in, token_out, amount)
-    ).await {
-        quotes.push(quote);
-    }
-
-    // 7. Try Aerodrome direct
-    if let Some(Ok(Some(quote))) = with_timeout(route_timeout,
-        dex::quote_aerodrome_best(rpc_url, token_in, token_out, amount)
-    ).await {
-        quotes.push(quote);
+    let hop_results = futures::future::join_all(hop_futs).await;
+    for result in hop_results {
+        if let Ok(route_quotes) = result {
+            quotes.extend(route_quotes);
+        }
     }
 
     Ok(quotes)

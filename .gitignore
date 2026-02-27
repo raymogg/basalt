@@ -1,0 +1,6 @@
+/target
+.basalt/
+
+# Environment variables (contains secrets)
+.env
+.env.local

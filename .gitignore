@@ -1,5 +1,7 @@
 /target
 .basalt/
+claude.md
+.claude
 
 # Environment variables (contains secrets)
 .env

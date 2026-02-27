@@ -175,7 +175,166 @@ async fn try_route(
         }
     }
 
-    // V4 via WETH (multi-hop, still needs discovery)
+    // V4 multi-hop V4-V4 with cached params
+    // Format: "v4-{token}-v4(v4_fee1,v4_tick1,v4_hooks1,v4_fee2,v4_tick2,v4_hooks2)"
+    if method.starts_with("v4-") && method.contains("-v4(") {
+        if let Some(rest) = method.strip_prefix("v4-") {
+            let parts: Vec<&str> = rest.split("-v4(").collect();
+            if parts.len() == 2 {
+                let intermediate_symbol = parts[0];
+                let params_str = parts[1].strip_suffix(")").unwrap_or("");
+                let params: Vec<&str> = params_str.split(',').collect();
+
+                if params.len() == 6 {
+                    if let (Ok(v4_fee1), Ok(v4_tick1), Ok(v4_hooks1), Ok(v4_fee2), Ok(v4_tick2), Ok(v4_hooks2)) = (
+                        params[0].parse::<u32>(),
+                        params[1].parse::<i32>(),
+                        params[2].parse::<Address>(),
+                        params[3].parse::<u32>(),
+                        params[4].parse::<i32>(),
+                        params[5].parse::<Address>(),
+                    ) {
+                        let intermediate_addr = match intermediate_symbol {
+                            "weth" => WETH.parse()?,
+                            "fleth" => FLETH.parse()?,
+                            _ => return Ok(None),
+                        };
+
+                        // Build first V4 pool (token_in -> intermediate)
+                        let zero_for_one1 = token_in < intermediate_addr;
+                        let (currency0_1, currency1_1) = if zero_for_one1 {
+                            (token_in, intermediate_addr)
+                        } else {
+                            (intermediate_addr, token_in)
+                        };
+
+                        let pool_info1 = crate::types::V4PoolInfo {
+                            pool_key: crate::types::V4PoolKey {
+                                currency0: currency0_1,
+                                currency1: currency1_1,
+                                fee: v4_fee1,
+                                tick_spacing: v4_tick1,
+                                hooks: v4_hooks1,
+                            },
+                            pool_id: [0u8; 32],
+                            sqrt_price_x96: alloy::primitives::Uint::<160, 3>::ZERO,
+                            liquidity: 0,
+                            zero_for_one: zero_for_one1,
+                        };
+
+                        // Execute first hop
+                        if let Ok(v4_quote1) = dex::quote_v4(rpc_url, token_in, amount, &pool_info1).await {
+                            // Build second V4 pool (intermediate -> token_out)
+                            let zero_for_one2 = intermediate_addr < token_out;
+                            let (currency0_2, currency1_2) = if zero_for_one2 {
+                                (intermediate_addr, token_out)
+                            } else {
+                                (token_out, intermediate_addr)
+                            };
+
+                            let pool_info2 = crate::types::V4PoolInfo {
+                                pool_key: crate::types::V4PoolKey {
+                                    currency0: currency0_2,
+                                    currency1: currency1_2,
+                                    fee: v4_fee2,
+                                    tick_spacing: v4_tick2,
+                                    hooks: v4_hooks2,
+                                },
+                                pool_id: [0u8; 32],
+                                sqrt_price_x96: alloy::primitives::Uint::<160, 3>::ZERO,
+                                liquidity: 0,
+                                zero_for_one: zero_for_one2,
+                            };
+
+                            // Execute second hop
+                            if let Ok(v4_quote2) = dex::quote_v4(rpc_url, intermediate_addr, v4_quote1.amount_out, &pool_info2).await {
+                                return Ok(Some(QuoteResult {
+                                    method: method.to_string(),
+                                    amount_out: v4_quote2.amount_out,
+                                    gas_estimate: None,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // V4 multi-hop via intermediate token with cached params
+    // Format: "v4-{token}-v3(v4_fee,v4_tick,v4_hooks,v3_fee)"
+    // Example: "v4-fleth-v3(0,60,0xF785bb...,3000)"
+    if method.starts_with("v4-") && method.contains("-v3(") {
+        // Extract intermediate token symbol and params
+        if let Some(rest) = method.strip_prefix("v4-") {
+            let parts: Vec<&str> = rest.split("-v3(").collect();
+            if parts.len() == 2 {
+                let intermediate_symbol = parts[0];
+                let params_str = parts[1].strip_suffix(")").unwrap_or("");
+                let params: Vec<&str> = params_str.split(',').collect();
+
+                if params.len() == 4 {
+                    if let (Ok(v4_fee), Ok(v4_tick), Ok(v4_hooks), Ok(v3_fee)) = (
+                        params[0].parse::<u32>(),
+                        params[1].parse::<i32>(),
+                        params[2].parse::<Address>(),
+                        params[3].parse::<u32>(),
+                    ) {
+                        // Determine intermediate token address
+                        let intermediate_addr = match intermediate_symbol {
+                            "weth" => WETH.parse()?,
+                            "fleth" => FLETH.parse()?,
+                            _ => return Ok(None), // Unknown intermediate
+                        };
+
+                        // Build V4 pool key for token_in -> intermediate
+                        let zero_for_one = token_in < intermediate_addr;
+                        let (currency0, currency1) = if zero_for_one {
+                            (token_in, intermediate_addr)
+                        } else {
+                            (intermediate_addr, token_in)
+                        };
+
+                        let v4_pool_key = crate::types::V4PoolKey {
+                            currency0,
+                            currency1,
+                            fee: v4_fee,
+                            tick_spacing: v4_tick,
+                            hooks: v4_hooks,
+                        };
+
+                        let v4_pool_info = crate::types::V4PoolInfo {
+                            pool_key: v4_pool_key,
+                            pool_id: [0u8; 32],
+                            sqrt_price_x96: alloy::primitives::Uint::<160, 3>::ZERO,
+                            liquidity: 0,
+                            zero_for_one,
+                        };
+
+                        // Execute: token_in -> intermediate via V4
+                        if let Ok(v4_quote) = dex::quote_v4(rpc_url, token_in, amount, &v4_pool_info).await {
+                            // Execute: intermediate -> token_out via V3
+                            if let Ok(v3_quote) = dex::quote_v3(
+                                rpc_url,
+                                intermediate_addr,
+                                token_out,
+                                v4_quote.amount_out,
+                                v3_fee,
+                            ).await {
+                                return Ok(Some(QuoteResult {
+                                    method: method.to_string(),
+                                    amount_out: v3_quote.amount_out,
+                                    gas_estimate: None,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // V4 via WETH (multi-hop, old format - still needs discovery)
     if method.starts_with("v4-weth-v3") || method.starts_with("v4-via-weth") {
         if let Some(pool_info) = dex::discover_v4_pool_key(rpc_url, token_in, weth_addr).await? {
             if let Ok(v4_quote) = dex::quote_v4(rpc_url, token_in, amount, &pool_info).await {
@@ -349,8 +508,18 @@ async fn try_all_routes(
                     if let Ok(final_quote) =
                         dex::quote_v4(rpc_url, intermediate, v4_quote.amount_out, &out_pool).await
                     {
+                        // Include both V4 pool params in method for caching
                         quotes.push(QuoteResult {
-                            method: format!("v4-{}-v4", intermediate_symbol),
+                            method: format!(
+                                "v4-{}-v4({},{},{},{},{},{})",
+                                intermediate_symbol,
+                                pool_info.pool_key.fee,
+                                pool_info.pool_key.tick_spacing,
+                                pool_info.pool_key.hooks,
+                                out_pool.pool_key.fee,
+                                out_pool.pool_key.tick_spacing,
+                                out_pool.pool_key.hooks
+                            ),
                             amount_out: final_quote.amount_out,
                             gas_estimate: None,
                         });
@@ -367,8 +536,16 @@ async fn try_all_routes(
                 )
                 .await
                 {
+                    // Include V4 pool params and V3 fee in method for caching
                     quotes.push(QuoteResult {
-                        method: format!("v4-{}-v3", intermediate_symbol),
+                        method: format!(
+                            "v4-{}-v3({},{},{},{})",
+                            intermediate_symbol,
+                            pool_info.pool_key.fee,
+                            pool_info.pool_key.tick_spacing,
+                            pool_info.pool_key.hooks,
+                            out_quote.method.strip_prefix("v3-direct(").and_then(|s| s.strip_suffix(")")).unwrap_or("3000")
+                        ),
                         amount_out: out_quote.amount_out,
                         gas_estimate: None,
                     });

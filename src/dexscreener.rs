@@ -70,8 +70,13 @@ impl DexScreenerPair {
         if self.pair_address.len() == 66 && self.pair_address.starts_with("0x") {
             let hex_str = &self.pair_address[2..];
             let mut bytes = [0u8; 32];
-            hex::decode_to_slice(hex_str, &mut bytes).ok()?;
-            Some(bytes)
+            match hex::decode_to_slice(hex_str, &mut bytes) {
+                Ok(_) => Some(bytes),
+                Err(e) => {
+                    eprintln!("[ERROR] Failed to decode pool ID hex: {}", e);
+                    None
+                }
+            }
         } else {
             None
         }

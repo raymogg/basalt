@@ -18,7 +18,9 @@ sol! {
             address indexed currency1,
             uint24 fee,
             int24 tickSpacing,
-            address hooks
+            address hooks,
+            uint160 sqrtPriceX96,
+            int24 tick
         );
     }
 }
@@ -98,36 +100,101 @@ async fn discover_pool_params_from_events(
 
     // Determine block range based on hint
     let latest_block = provider.get_block_number().await?;
+    let block_range_size = 1800; // ±1800 blocks = ~1 hour on Base (2s/block)
+
     let from_block = if let Some(hint_block) = creation_block_hint {
-        // Search narrow range: ±100 blocks around the hint (~3.3 minutes on Base)
-        hint_block.saturating_sub(100)
+        hint_block.saturating_sub(block_range_size)
     } else {
         // Fallback: Search last 5M blocks (about 2.5 months on Base with 2-second blocks)
         latest_block.saturating_sub(5_000_000)
     };
 
     let to_block = if let Some(hint_block) = creation_block_hint {
-        hint_block.saturating_add(100).min(latest_block)
+        hint_block.saturating_add(block_range_size).min(latest_block)
     } else {
         latest_block
     };
 
-    let logs = provider
-        .get_logs(&filter.from_block(from_block).to_block(to_block))
-        .await?;
+    // Calculate approximate time range (2 seconds per block on Base)
+    let blocks_from_latest = latest_block.saturating_sub(from_block);
+    let seconds_from_latest = blocks_from_latest * 2;
+    let minutes_ago = seconds_from_latest / 60;
+
+    eprintln!("[V4 DISCOVERY] Searching for Initialize event for pool {:?}",
+        alloy::primitives::hex::encode(&pool_id));
+    eprintln!("[V4 DISCOVERY]   PoolManager address: {}", POOL_MANAGER);
+    eprintln!("[V4 DISCOVERY]   Block range: {} to {} (latest: {})",
+        from_block, to_block, latest_block);
+    eprintln!("[V4 DISCOVERY]   Time range: ~{} to ~{} minutes ago",
+        minutes_ago, latest_block.saturating_sub(to_block) * 2 / 60);
+    if let Some(hint) = creation_block_hint {
+        eprintln!("[V4 DISCOVERY]   Hint block: {} (±{})", hint, block_range_size);
+    }
+
+    eprintln!("[V4 DISCOVERY]   Querying logs...");
+
+    // Try with retry logic for rate limits
+    let mut attempts = 0;
+    let max_attempts = 3;
+    let logs = loop {
+        attempts += 1;
+        // Clone the filter for each attempt since it gets consumed
+        let query_filter = filter
+            .clone()
+            .from_block(from_block)
+            .to_block(to_block);
+
+        match provider.get_logs(&query_filter).await {
+                Ok(logs) => {
+                    break logs;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+
+                    // Check if it's a rate limit error
+                    if err_str.contains("429") || err_str.contains("Too Many Requests") || err_str.contains("rate limit") {
+                        if attempts < max_attempts {
+                            let delay_ms = 1000 * attempts; // 1s, 2s, 3s
+                            eprintln!("[V4 DISCOVERY] Rate limited, retrying in {}ms (attempt {}/{})", delay_ms, attempts, max_attempts);
+                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms as u64)).await;
+                            continue;
+                        } else {
+                            eprintln!("[ERROR] V4 event query unavailable after {} attempts (rate limited)", max_attempts);
+                            // Return Ok(None) to trigger brute-force fallback instead of erroring
+                            return Ok(None);
+                        }
+                    } else {
+                        // Non-rate-limit error, return it
+                        eprintln!("[ERROR] V4 event query failed: {}", err_str);
+                        return Err(e.into());
+                    }
+                }
+            }
+    };
 
     if let Some(log) = logs.first() {
         // Decode the event
         let topics: Vec<_> = log.topics().iter().copied().collect();
-        let event = IPoolManager::Initialize::decode_raw_log(&topics, &log.data().data, true)?;
 
-        return Ok(Some(V4PoolKey {
-            currency0: event.currency0,
-            currency1: event.currency1,
-            fee: event.fee.try_into()?,
-            tick_spacing: event.tickSpacing.try_into()?,
-            hooks: event.hooks,
-        }));
+        match IPoolManager::Initialize::decode_raw_log(&topics, &log.data().data, true) {
+            Ok(event) => {
+                eprintln!("[V4 DISCOVERY] Found pool via Initialize event");
+                eprintln!("[V4 DISCOVERY]   fee={}, tickSpacing={}, hooks={}",
+                    event.fee, event.tickSpacing, event.hooks);
+
+                return Ok(Some(V4PoolKey {
+                    currency0: event.currency0,
+                    currency1: event.currency1,
+                    fee: event.fee.try_into()?,
+                    tick_spacing: event.tickSpacing.try_into()?,
+                    hooks: event.hooks,
+                }));
+            }
+            Err(e) => {
+                eprintln!("[ERROR] Failed to decode Initialize event: {}", e);
+                return Err(e.into());
+            }
+        }
     }
 
     Ok(None)
@@ -157,40 +224,63 @@ pub async fn discover_v4_pool_key_with_target(
     }
 
     // If we have a target pool ID, try querying the Initialize event first
-    // (silently falls back to brute-force if RPC doesn't support log queries)
     if let Some(target) = target_pool_id {
-        if let Ok(Some(pool_key)) = discover_pool_params_from_events(rpc_url, target, creation_block_hint).await {
-            // Verify the pool exists and has liquidity
-            let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
-            let state_view = IStateView::new(V4_STATE_VIEW.parse()?, provider);
+        eprintln!("[V4 DISCOVERY] Attempting event-based discovery for pool 0x{}",
+            alloy::primitives::hex::encode(&target));
 
-            if let Ok(slot0) = state_view.getSlot0(target.into()).call().await {
-                if slot0.sqrtPriceX96 > alloy::primitives::Uint::<160, 3>::ZERO {
-                    let liquidity = state_view
-                        .getLiquidity(target.into())
-                        .call()
-                        .await
-                        .map(|l| l.liquidity)
-                        .unwrap_or(0);
+        match discover_pool_params_from_events(rpc_url, target, creation_block_hint).await {
+            Ok(Some(pool_key)) => {
+                eprintln!("[V4 DISCOVERY] Event discovery succeeded, verifying pool on-chain");
 
-                    let zero_for_one = token_address < quote_token;
+                // Verify the pool exists and has liquidity
+                let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
+                let state_view = IStateView::new(V4_STATE_VIEW.parse()?, provider);
 
-                    let pool_info = V4PoolInfo {
-                        pool_key,
-                        pool_id: target,
-                        sqrt_price_x96: slot0.sqrtPriceX96,
-                        liquidity,
-                        zero_for_one,
-                    };
+                match state_view.getSlot0(target.into()).call().await {
+                    Ok(slot0) => {
+                        if slot0.sqrtPriceX96 > alloy::primitives::Uint::<160, 3>::ZERO {
+                            let liquidity = state_view
+                                .getLiquidity(target.into())
+                                .call()
+                                .await
+                                .map(|l| l.liquidity)
+                                .unwrap_or(0);
 
-                    // Cache for future use
-                    cache::cache_pool(cache_key.clone(), pool_info.clone());
+                            let zero_for_one = token_address < quote_token;
 
-                    return Ok(Some(pool_info));
+                            eprintln!("[V4 DISCOVERY] Pool verified: liquidity={}", liquidity);
+
+                            let pool_info = V4PoolInfo {
+                                pool_key,
+                                pool_id: target,
+                                sqrt_price_x96: slot0.sqrtPriceX96,
+                                liquidity,
+                                zero_for_one,
+                            };
+
+                            // Cache for future use
+                            cache::cache_pool(cache_key.clone(), pool_info.clone());
+
+                            return Ok(Some(pool_info));
+                        } else {
+                            eprintln!("[ERROR] Pool has zero price, not initialized");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[ERROR] Failed to get slot0: {}", e);
+                    }
                 }
+            }
+            Ok(None) => {
+                eprintln!("[V4 DISCOVERY] Event discovery returned None, falling back to brute-force");
+            }
+            Err(e) => {
+                eprintln!("[ERROR] Event discovery error: {}, falling back to brute-force", e);
             }
         }
     }
+
+    eprintln!("[V4 DISCOVERY] Starting brute-force discovery");
 
     // Sort currencies (V4 requires currency0 < currency1)
     let zero_for_one = token_address < quote_token;
@@ -232,17 +322,12 @@ pub async fn discover_v4_pool_key_with_target(
                 };
                 let pool_id = compute_pool_id(&pool_key);
 
-                // If target_pool_id is specified, skip if this doesn't match
-                if let Some(target) = target_pool_id {
-                    if pool_id != target {
-                        continue;
-                    }
-                }
-
                 pool_candidates.push((pool_key, pool_id));
             }
         }
     }
+
+    eprintln!("[V4 DISCOVERY] Checking {} pool candidates", pool_candidates.len());
 
     // Check all candidates in parallel
     let mut tasks = Vec::new();
@@ -277,6 +362,11 @@ pub async fn discover_v4_pool_key_with_target(
     // Wait for all tasks and return first successful match
     for task in tasks {
         if let Ok(Some((pool_key, pool_id, sqrt_price_x96, liquidity))) = task.await {
+            eprintln!("[V4 DISCOVERY] Found active pool");
+            eprintln!("[V4 DISCOVERY]   fee={}, tickSpacing={}, hooks={}",
+                pool_key.fee, pool_key.tick_spacing, pool_key.hooks);
+            eprintln!("[V4 DISCOVERY]   liquidity={}", liquidity);
+
             let pool_info = V4PoolInfo {
                 pool_key,
                 pool_id,
@@ -328,18 +418,19 @@ pub async fn quote_v4(
     };
 
     match quoter.quoteExactInputSingle(params).call().await {
-        Ok(result) => Ok(QuoteResult {
-            // Store pool params in method for caching
-            method: format!(
-                "v4-direct({},{},{})",
-                pool_info.pool_key.fee, pool_info.pool_key.tick_spacing, pool_info.pool_key.hooks
-            ),
-            amount_out: result.amountOut,
-            gas_estimate: Some(result.gasEstimate),
-        }),
+        Ok(result) => {
+            Ok(QuoteResult {
+                // Store pool params in method for caching
+                method: format!(
+                    "v4-direct({},{},{})",
+                    pool_info.pool_key.fee, pool_info.pool_key.tick_spacing, pool_info.pool_key.hooks
+                ),
+                amount_out: result.amountOut,
+                gas_estimate: Some(result.gasEstimate),
+            })
+        }
         Err(e) => {
-            // V4 Quoter might revert with the quote in the error data
-            // Try to decode it
+            eprintln!("[ERROR] V4 quote failed: {}", e);
             anyhow::bail!("V4 quote failed: {}", e);
         }
     }

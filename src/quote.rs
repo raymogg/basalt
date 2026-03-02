@@ -463,34 +463,60 @@ async fn get_v4_routing_info(
     let mut routes = Vec::new();
 
     // Try to get V4 pairs from DexScreener
-    if let Ok(pairs) = dexscreener::get_v4_pairs(token_address).await {
-        // Get current block and timestamp for block estimation
-        use alloy::providers::Provider;
-        if let Ok(rpc_url_parsed) = rpc_url.parse::<reqwest::Url>() {
-            let provider = alloy::providers::ProviderBuilder::new().on_http(rpc_url_parsed);
+    match dexscreener::get_v4_pairs(token_address).await {
+        Ok(pairs) => {
+            // Get current block and timestamp for block estimation
+            use alloy::providers::Provider;
+            match rpc_url.parse::<reqwest::Url>() {
+                Ok(rpc_url_parsed) => {
+                    let provider = alloy::providers::ProviderBuilder::new().on_http(rpc_url_parsed);
 
-            if let (Ok(current_block), Ok(Some(latest_block_data))) = (
-                provider.get_block_number().await,
-                provider.get_block_by_number(
-                    alloy::rpc::types::BlockNumberOrTag::Latest,
-                    alloy::rpc::types::BlockTransactionsKind::Hashes,
-                ).await,
-            ) {
-                let current_timestamp: u64 = latest_block_data.header.timestamp;
+                    let block_result = provider.get_block_number().await;
+                    let latest_block_result = provider.get_block_by_number(
+                        alloy::rpc::types::BlockNumberOrTag::Latest,
+                        alloy::rpc::types::BlockTransactionsKind::Hashes,
+                    ).await;
 
-                for pair in pairs {
-                    // Parse quote token address, pool ID, and estimate creation block
-                    if let Some(quote_addr) = pair.quote_token_address() {
-                        let pool_id = pair.pool_id();
-                        let creation_block = pair.estimate_creation_block(current_block, current_timestamp);
+                    match (block_result, latest_block_result) {
+                        (Ok(current_block), Ok(Some(latest_block_data))) => {
+                            let current_timestamp: u64 = latest_block_data.header.timestamp;
 
-                        // Only add if not already in list
-                        if !routes.iter().any(|(addr, _, _)| *addr == quote_addr) {
-                            routes.push((quote_addr, pool_id, creation_block));
+                            for pair in pairs.iter() {
+                                // Parse quote token address, pool ID, and estimate creation block
+                                match pair.quote_token_address() {
+                                    Some(quote_addr) => {
+                                        let pool_id = pair.pool_id();
+                                        let creation_block = pair.estimate_creation_block(current_block, current_timestamp);
+
+                                        // Only add if not already in list
+                                        if !routes.iter().any(|(addr, _, _)| *addr == quote_addr) {
+                                            routes.push((quote_addr, pool_id, creation_block));
+                                        }
+                                    }
+                                    None => {
+                                        eprintln!("[ERROR] Failed to parse quote token address from DexScreener pair");
+                                    }
+                                }
+                            }
+                        }
+                        (Err(e), _) => {
+                            eprintln!("[ERROR] Failed to get current block number: {}", e);
+                        }
+                        (_, Err(e)) => {
+                            eprintln!("[ERROR] Failed to get latest block data: {}", e);
+                        }
+                        (_, Ok(None)) => {
+                            eprintln!("[ERROR] Latest block returned None");
                         }
                     }
                 }
+                Err(e) => {
+                    eprintln!("[ERROR] Failed to parse RPC URL '{}': {}", rpc_url, e);
+                }
             }
+        }
+        Err(e) => {
+            eprintln!("[ERROR] Failed to fetch V4 pairs from DexScreener: {}", e);
         }
     }
 
@@ -526,10 +552,22 @@ async fn try_all_routes(
     // Build all route tasks to run in parallel
     let mut route_tasks: Vec<tokio::task::JoinHandle<Vec<QuoteResult>>> = Vec::new();
 
+    // Check if any DexScreener route is for the direct pool (token_in -> token_out)
+    let direct_pool_info = v4_routes
+        .iter()
+        .find(|(intermediate, _, _)| *intermediate == token_out)
+        .map(|(_, pool_id, block_hint)| (*pool_id, *block_hint));
+
     // 1. V4 direct (token_in -> token_out)
     let rpc_url_clone = rpc_url.to_string();
     route_tasks.push(tokio::spawn(async move {
-        if let Ok(Some(pool_info)) = dex::discover_v4_pool_key(&rpc_url_clone, token_in, token_out).await {
+        if let Ok(Some(pool_info)) = dex::v4::discover_v4_pool_key_with_target(
+            &rpc_url_clone,
+            token_in,
+            token_out,
+            direct_pool_info.and_then(|(id, _)| id),
+            direct_pool_info.and_then(|(_, hint)| hint),
+        ).await {
             if let Ok(v4_quote) = dex::quote_v4(&rpc_url_clone, token_in, amount, &pool_info).await {
                 return vec![v4_quote];
             }

@@ -31,11 +31,14 @@ pub const AERO_DEFAULT_FACTORY: &str = "0x420DD381b31aEf6683db6B902084cB0FFECe40
 
 // Known Clanker V4 hooks addresses (discovered via Initialize events)
 pub const CLANKER_HOOKS: &[&str] = &[
+    "0x0000000000000000000000000000000000000000", // No hooks (vanilla V4)
     "0xbb7784a4d481184283ed89619a3e3ed143e1adc0", // hooks v1 (older pools)
     "0xd60d6b218116cfd801e28f78d011a203d2b068cc", // hooks v2
     "0xb429d62f8f3bffb98cdb9569533ea23bf0ba28cc", // hooks v3
     "0x23321f11a6d44fd1ab790044fdfde5758c902fdc", // hooks v4
-    "0xF785bb58059FAB6fb19bDdA2CB9078d9E546Efdc", // hooks v5 (OSO/flETH and newer)
+    "0xF785bb58059FAB6fb19bDdA2CB9078d9E546Efdc", // hooks v5 (OSO/flETH and newer),
+    "0x34a45c6B61876d739400Bd71228CbcbD4F53E8cC",
+    "0xDd5EeaFf7BD481AD55Db083062b13a3cdf0A68CC",
 ];
 
 // Known quote tokens for V4 pools

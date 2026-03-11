@@ -48,6 +48,7 @@ pub struct QuoteResult {
     pub method: String,
     pub amount_out: U256,
     pub gas_estimate: Option<U256>,
+    pub pool_id: Option<String>, // V4 pool ID (0x-prefixed hex) for pool lookup
 }
 
 #[derive(Debug, Clone)]
@@ -82,7 +83,7 @@ pub struct TokenRegistry {
 // V4 Pool Registry - stores all known valid V4 pools
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V4PoolRegistry {
-    // Key: "token0_token1" (sorted), Value: pool parameters
+    // Key: "token0_token1_fee_tickspacing_hooks" (sorted), Value: pool parameters
     pub pools: std::collections::HashMap<String, V4PoolKeyData>,
     pub updated_at: u64,
 }
@@ -96,3 +97,4 @@ pub struct V4PoolKeyData {
     pub hooks: String, // Address as string
     pub discovered_at: u64,
 }
+

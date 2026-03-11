@@ -256,10 +256,10 @@ pub fn get_cached_pool(key: &str) -> Option<crate::types::V4PoolInfo> {
     cache.get(key).cloned()
 }
 
-/// Cache V4 pool info
+/// Cache V4 pool info (in-memory + persistent registry)
 pub fn cache_pool(key: String, pool_info: crate::types::V4PoolInfo) {
     let mut cache = pool_key_cache().lock().unwrap();
-    cache.insert(key.clone(), pool_info.clone());
+    cache.insert(key, pool_info.clone());
 
     // Also add to persistent global registry
     let _ = add_to_v4_pool_registry(&pool_info.pool_key);
@@ -327,7 +327,7 @@ pub fn add_to_v4_pool_registry(pool_key: &crate::types::V4PoolKey) -> Result<()>
     Ok(())
 }
 
-/// Get all known V4 pools for a token pair
+/// Get all known V4 pools for a token pair from the persistent registry
 pub fn get_v4_pools_for_pair(token_a: Address, token_b: Address) -> Result<Vec<crate::types::V4PoolKey>> {
     let registry = load_v4_pool_registry()?;
     let mut pools = Vec::new();

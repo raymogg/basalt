@@ -47,6 +47,7 @@ pub async fn quote_aerodrome(
                     method: format!("aerodrome-{}", if stable { "stable" } else { "volatile" }),
                     amount_out: amounts.amounts[1],
                     gas_estimate: None,
+                    pool_id: None,
                 })
             } else {
                 anyhow::bail!("Aerodrome returned zero output");

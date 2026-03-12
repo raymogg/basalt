@@ -5,3 +5,4 @@ pub mod dexscreener;
 pub mod poolscout;
 pub mod quote;
 pub mod types;
+pub mod universal_router;

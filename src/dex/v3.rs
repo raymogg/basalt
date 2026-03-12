@@ -52,7 +52,7 @@ pub async fn quote_v3(
             amount_out: result.amountOut,
             gas_estimate: Some(result.gasEstimate),
             pool_id: None,
-            calldata: None,
+            calldata: None, // Set by quote.rs using Universal Router encoding
         }),
         Err(e) => {
             anyhow::bail!("V3 quote failed: {}", e);

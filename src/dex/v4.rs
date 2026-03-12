@@ -165,32 +165,16 @@ pub async fn quote_v4(
 
     match quoter.quoteExactInputSingle(params).call().await {
         Ok(result) => {
-            // Encode the quoter calldata (same params structure used for execution)
-            let calldata = alloy::sol_types::SolCall::abi_encode(&IV4Quoter::quoteExactInputSingleCall {
-                params: IV4Quoter::QuoteParams {
-                    poolKey: IV4Quoter::PoolKey {
-                        currency0: pool_info.pool_key.currency0,
-                        currency1: pool_info.pool_key.currency1,
-                        fee: pool_info.pool_key.fee_as_u24(),
-                        tickSpacing: pool_info.pool_key.tick_spacing_as_i24(),
-                        hooks: pool_info.pool_key.hooks,
-                    },
-                    zeroForOne: pool_info.zero_for_one,
-                    exactAmount: amount.to::<u128>(),
-                    hookData: alloy::primitives::Bytes::new(),
-                },
-            });
-
             Ok(QuoteResult {
                 method: format!(
                     "v4-direct({},{},{})",
                     pool_info.pool_key.fee, pool_info.pool_key.tick_spacing, pool_info.pool_key.hooks
                 ),
-                display_name: String::new(), // Set by caller with token symbols
+                display_name: String::new(),
                 amount_out: result.amountOut,
                 gas_estimate: Some(result.gasEstimate),
                 pool_id: Some(format!("0x{}", alloy::primitives::hex::encode(pool_info.pool_id))),
-                calldata: Some(format!("0x{}", alloy::primitives::hex::encode(&calldata))),
+                calldata: None, // Set by quote.rs using Universal Router encoding
             })
         }
         Err(e) => {

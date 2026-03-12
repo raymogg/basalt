@@ -2,10 +2,13 @@ mod cache;
 mod constants;
 mod dex;
 mod dexscreener;
+mod executor;
 mod poolscout;
 mod quote;
+mod trade;
 mod types;
 mod universal_router;
+mod wallet;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -44,6 +47,24 @@ enum Commands {
         #[arg(long, default_value = "1.0")]
         test_amount: String,
     },
+
+    /// Execute a swap on-chain (requires BASALT_PRIVATE_KEY)
+    Execute {
+        /// Amount of input token to swap
+        amount: String,
+
+        /// Input token (symbol or address)
+        #[arg(short, long)]
+        from: String,
+
+        /// Output token (symbol or address)
+        #[arg(short, long)]
+        to: String,
+
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -77,6 +98,14 @@ async fn main() -> Result<()> {
         }
         Commands::RefreshCache { test_amount } => {
             quote::refresh_all_cached_routes(&test_amount).await?;
+        }
+        Commands::Execute {
+            amount,
+            from,
+            to,
+            yes,
+        } => {
+            trade::execute_swap(&amount, &from, &to, yes).await?;
         }
     }
 

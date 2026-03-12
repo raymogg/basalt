@@ -34,7 +34,7 @@ pub async fn quote_v3(
     amount_in: U256,
     fee: u32,
 ) -> Result<QuoteResult> {
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let quoter = IQuoterV2::new(V3_QUOTER_V2.parse()?, provider);
 
     let params = IQuoterV2::QuoteExactInputSingleParams {

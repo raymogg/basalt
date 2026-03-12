@@ -28,7 +28,7 @@ pub async fn quote_aerodrome(
     amount_in: U256,
     stable: bool,
 ) -> Result<QuoteResult> {
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let router = IAeroRouter::new(AERO_ROUTER.parse()?, provider);
 
     let route = IAeroRouter::Route {
@@ -42,11 +42,11 @@ pub async fn quote_aerodrome(
 
     match router.getAmountsOut(amount_in, routes).call().await {
         Ok(amounts) => {
-            if amounts.amounts.len() >= 2 && amounts.amounts[1] > U256::ZERO {
+            if amounts.len() >= 2 && amounts[1] > U256::ZERO {
                 Ok(QuoteResult {
                     method: format!("aerodrome-{}", if stable { "stable" } else { "volatile" }),
                     display_name: String::new(),
-                    amount_out: amounts.amounts[1],
+                    amount_out: amounts[1],
                     gas_estimate: None,
                     pool_id: None,
                     calldata: None,

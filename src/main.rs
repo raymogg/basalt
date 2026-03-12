@@ -5,6 +5,7 @@ mod dexscreener;
 mod poolscout;
 mod quote;
 mod types;
+mod universal_router;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

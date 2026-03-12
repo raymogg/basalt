@@ -3,8 +3,121 @@ use crate::constants::{get_base_rpc, V3_FEES, WETH, FLETH, USDC};
 use crate::dex;
 use crate::poolscout;
 use crate::types::{FullQuoteResult, QuoteResult};
+use crate::universal_router;
 use alloy::primitives::{Address, U256};
 use anyhow::Result;
+
+/// Default deadline: 5 minutes from now
+fn default_deadline() -> U256 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    U256::from(now + 300)
+}
+
+/// Generate Universal Router execute() calldata for the best route.
+/// Reconstructs pool keys from the method string and generates proper calldata.
+fn generate_calldata(
+    method: &str,
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+    amount_out: U256,
+) -> Option<String> {
+    let deadline = default_deadline();
+    // Apply 0.5% slippage tolerance
+    let min_out = amount_out * U256::from(995) / U256::from(1000);
+
+    // V4 direct: "v4-direct(fee,tickSpacing,hooks)"
+    if method.starts_with("v4-direct(") {
+        let params_str = method.strip_prefix("v4-direct(")?.strip_suffix(")")?;
+        let parts: Vec<&str> = params_str.split(',').collect();
+        if parts.len() != 3 { return None; }
+        let fee = parts[0].parse::<u32>().ok()?;
+        let tick_spacing = parts[1].parse::<i32>().ok()?;
+        let hooks = parts[2].parse::<Address>().ok()?;
+        let zero_for_one = token_in < token_out;
+        let (c0, c1) = if zero_for_one { (token_in, token_out) } else { (token_out, token_in) };
+        let pool_key = crate::types::V4PoolKey { currency0: c0, currency1: c1, fee, tick_spacing, hooks };
+        let calldata = universal_router::encode_v4_single(
+            &pool_key, zero_for_one, amount_in.to::<u128>(), min_out.to::<u128>(), deadline,
+        );
+        return Some(format!("0x{}", alloy::primitives::hex::encode(&calldata)));
+    }
+
+    // V3 direct: "v3-direct(fee)"
+    if method.starts_with("v3-direct(") {
+        let fee_str = method.strip_prefix("v3-direct(")?.strip_suffix(")")?;
+        let fee = fee_str.parse::<u32>().ok()?;
+        let calldata = universal_router::encode_v3_single(
+            token_in, token_out, fee, amount_in, min_out, deadline,
+        );
+        return Some(format!("0x{}", alloy::primitives::hex::encode(&calldata)));
+    }
+
+    // V4 -> V3 multi-hop: "v4-{intermediate}-v3(v4_fee,v4_tick,v4_hooks,v3_fee)"
+    if method.starts_with("v4-") && method.contains("-v3(") {
+        let rest = method.strip_prefix("v4-")?;
+        let parts: Vec<&str> = rest.split("-v3(").collect();
+        if parts.len() != 2 { return None; }
+        let intermediate_symbol = parts[0];
+        let params_str = parts[1].strip_suffix(")")?;
+        let params: Vec<&str> = params_str.split(',').collect();
+        if params.len() != 4 { return None; }
+
+        let v4_fee = params[0].parse::<u32>().ok()?;
+        let v4_tick = params[1].parse::<i32>().ok()?;
+        let v4_hooks = params[2].parse::<Address>().ok()?;
+        let v3_fee = params[3].parse::<u32>().ok()?;
+
+        let intermediate = resolve_intermediate_address(intermediate_symbol)?;
+        let v4_zero_for_one = token_in < intermediate;
+        let (c0, c1) = if v4_zero_for_one { (token_in, intermediate) } else { (intermediate, token_in) };
+        let v4_pool_key = crate::types::V4PoolKey { currency0: c0, currency1: c1, fee: v4_fee, tick_spacing: v4_tick, hooks: v4_hooks };
+
+        let calldata = universal_router::encode_v4_v3_multihop(
+            &v4_pool_key, v4_zero_for_one, amount_in.to::<u128>(),
+            intermediate, token_out, v3_fee, min_out, deadline,
+        );
+        return Some(format!("0x{}", alloy::primitives::hex::encode(&calldata)));
+    }
+
+    // V4 -> V4 multi-hop: "v4-{intermediate}-v4(f1,t1,h1,f2,t2,h2)"
+    if method.starts_with("v4-") && method.contains("-v4(") {
+        let rest = method.strip_prefix("v4-")?;
+        let parts: Vec<&str> = rest.split("-v4(").collect();
+        if parts.len() != 2 { return None; }
+        let intermediate_symbol = parts[0];
+        let params_str = parts[1].strip_suffix(")")?;
+        let params: Vec<&str> = params_str.split(',').collect();
+        if params.len() != 6 { return None; }
+
+        let f1 = params[0].parse::<u32>().ok()?;
+        let t1 = params[1].parse::<i32>().ok()?;
+        let h1 = params[2].parse::<Address>().ok()?;
+        let f2 = params[3].parse::<u32>().ok()?;
+        let t2 = params[4].parse::<i32>().ok()?;
+        let h2 = params[5].parse::<Address>().ok()?;
+
+        let intermediate = resolve_intermediate_address(intermediate_symbol)?;
+        let zfo1 = token_in < intermediate;
+        let (c0_1, c1_1) = if zfo1 { (token_in, intermediate) } else { (intermediate, token_in) };
+        let pk1 = crate::types::V4PoolKey { currency0: c0_1, currency1: c1_1, fee: f1, tick_spacing: t1, hooks: h1 };
+
+        let zfo2 = intermediate < token_out;
+        let (c0_2, c1_2) = if zfo2 { (intermediate, token_out) } else { (token_out, intermediate) };
+        let pk2 = crate::types::V4PoolKey { currency0: c0_2, currency1: c1_2, fee: f2, tick_spacing: t2, hooks: h2 };
+
+        let calldata = universal_router::encode_v4_v4_multihop(
+            &pk1, zfo1, amount_in.to::<u128>(), &pk2, zfo2, min_out.to::<u128>(), deadline,
+        );
+        return Some(format!("0x{}", alloy::primitives::hex::encode(&calldata)));
+    }
+
+    // Aerodrome and other routes — no Universal Router support yet
+    None
+}
 
 /// Resolve an address to a human-readable symbol using known constants and token registry cache.
 /// Falls back to a truncated address like "0xc43F..e485".
@@ -110,8 +223,13 @@ pub async fn get_quote(
         let _ = cache::cache_routes(token_in, token_out, &quotes);
     }
 
-    // Find best quote
-    let best_quote = quotes.iter().max_by_key(|q| q.amount_out).cloned();
+    // Find best quote and generate execution calldata
+    let best_quote = quotes.iter().max_by_key(|q| q.amount_out).cloned().map(|mut q| {
+        if q.calldata.is_none() {
+            q.calldata = generate_calldata(&q.method, token_in, token_out, amount_in, q.amount_out);
+        }
+        q
+    });
 
     Ok(FullQuoteResult {
         token: crate::types::TokenBalance {
@@ -659,7 +777,6 @@ async fn try_all_routes(
 
                     // Add V4->V4 result
                     if let Some((out_pool, final_quote)) = v4_v4_result {
-                        // Build pool route: leg1_pool -> leg2_pool
                         let pool_route = match (&leg1_pool_id, &final_quote.pool_id) {
                             (Some(p1), Some(p2)) => Some(format!("{} -> {}", p1, p2)),
                             (Some(p1), None) => Some(p1.clone()),
@@ -680,13 +797,12 @@ async fn try_all_routes(
                             amount_out: final_quote.amount_out,
                             gas_estimate: None,
                             pool_id: pool_route,
-                            calldata: None,
+                            calldata: None, // Generated for best route in get_quote()
                         });
                     }
 
                     // Add V4->V3 result
                     if let Some(out_quote) = v4_v3_result {
-                        // For V4->V3, only the V4 leg has a pool ID
                         let pool_route = leg1_pool_id.clone();
                         results.push(QuoteResult {
                             method: format!(
@@ -701,7 +817,7 @@ async fn try_all_routes(
                             amount_out: out_quote.amount_out,
                             gas_estimate: None,
                             pool_id: pool_route,
-                            calldata: None,
+                            calldata: None, // Generated for best route in get_quote()
                         });
                     }
                 }
@@ -876,8 +992,10 @@ pub async fn quote_swap(amount_str: &str, from_str: &str, to_str: &str) -> Resul
 
             if let Some(ref cd) = best.calldata {
                 println!();
-                println!("Calldata:");
-                println!("  {}", cd);
+                println!("Execution:");
+                println!("  Router:     {}", universal_router::UNIVERSAL_ROUTER);
+                println!("  Slippage:   0.5%");
+                println!("  Calldata:   {}", cd);
             }
         }
     } else {

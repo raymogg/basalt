@@ -48,9 +48,11 @@ pub async fn quote_v3(
     match quoter.quoteExactInputSingle(params).call().await {
         Ok(result) => Ok(QuoteResult {
             method: format!("v3-direct({})", fee),
+            display_name: String::new(),
             amount_out: result.amountOut,
             gas_estimate: Some(result.gasEstimate),
             pool_id: None,
+            calldata: None,
         }),
         Err(e) => {
             anyhow::bail!("V3 quote failed: {}", e);

@@ -1,10 +1,37 @@
 use crate::cache;
-use crate::constants::{get_base_rpc, V3_FEES, WETH, FLETH};
+use crate::constants::{get_base_rpc, V3_FEES, WETH, FLETH, USDC};
 use crate::dex;
 use crate::poolscout;
 use crate::types::{FullQuoteResult, QuoteResult};
 use alloy::primitives::{Address, U256};
 use anyhow::Result;
+
+/// Resolve an address to a human-readable symbol using known constants and token registry cache.
+/// Falls back to a truncated address like "0xc43F..e485".
+fn symbol_for_address(addr: Address) -> String {
+    let weth: Address = WETH.parse().unwrap_or(Address::ZERO);
+    let usdc: Address = USDC.parse().unwrap_or(Address::ZERO);
+    let fleth: Address = FLETH.parse().unwrap_or(Address::ZERO);
+
+    if addr == weth {
+        return "WETH".to_string();
+    }
+    if addr == usdc {
+        return "USDC".to_string();
+    }
+    if addr == fleth {
+        return "flETH".to_string();
+    }
+
+    // Check token registry cache
+    if let Ok(Some(reg)) = cache::get_cached_token(addr) {
+        return reg.symbol;
+    }
+
+    // Truncated address fallback
+    let s = format!("{}", addr);
+    format!("{}..{}", &s[..6], &s[s.len()-4..])
+}
 
 /// Get cache refresh interval from env var or use default
 fn cache_refresh_interval() -> u64 {
@@ -48,10 +75,10 @@ pub async fn get_quote(
         .ok()
         .flatten();
 
-    let needs_full_refresh = cached_routes.is_none();
+    let mut needs_full_refresh = cached_routes.is_none();
 
     if let Some(route_cache) = cached_routes {
-        // Try all cached routes in parallel
+        // Try all cached routes
         for cached_route in &route_cache.routes {
             if let Ok(Some(quote)) = try_route(
                 &rpc_url,
@@ -65,9 +92,15 @@ pub async fn get_quote(
                 quotes.push(quote);
             }
         }
+
+        // If all cached routes failed, fall back to full discovery
+        if quotes.is_empty() {
+            eprintln!("[cache] All cached routes failed, falling back to full discovery");
+            needs_full_refresh = true;
+        }
     }
 
-    // If cache miss or periodic refresh, do full fan-out
+    // If cache miss, all cached routes failed, or periodic refresh, do full fan-out
     if needs_full_refresh {
         let routes_start = std::time::Instant::now();
         quotes = try_all_routes(&rpc_url, token_in, token_out, amount_in).await?;
@@ -88,6 +121,17 @@ pub async fn get_quote(
         quotes,
         best_quote,
     })
+}
+
+/// Resolve an intermediate token symbol (from a cached method string) to its address.
+fn resolve_intermediate_address(symbol: &str) -> Option<Address> {
+    match symbol {
+        "weth" => WETH.parse().ok(),
+        "fleth" => FLETH.parse().ok(),
+        "usdc" => USDC.parse().ok(),
+        // Try parsing as a raw address (for truncated or full address intermediates)
+        other => other.parse::<Address>().ok(),
+    }
 }
 
 /// Try a specific route method (from cache - uses exact pool/fee specified)
@@ -199,10 +243,9 @@ async fn try_route(
                         params[4].parse::<i32>(),
                         params[5].parse::<Address>(),
                     ) {
-                        let intermediate_addr = match intermediate_symbol {
-                            "weth" => WETH.parse()?,
-                            "fleth" => FLETH.parse()?,
-                            _ => return Ok(None),
+                        let intermediate_addr = match resolve_intermediate_address(intermediate_symbol) {
+                            Some(addr) => addr,
+                            None => return Ok(None),
                         };
 
                         // Build first V4 pool (token_in -> intermediate)
@@ -255,9 +298,11 @@ async fn try_route(
                             if let Ok(v4_quote2) = dex::quote_v4(rpc_url, intermediate_addr, v4_quote1.amount_out, &pool_info2).await {
                                 return Ok(Some(QuoteResult {
                                     method: method.to_string(),
+                                    display_name: String::new(),
                                     amount_out: v4_quote2.amount_out,
                                     gas_estimate: None,
                                     pool_id: None,
+                                    calldata: None,
                                 }));
                             }
                         }
@@ -287,10 +332,9 @@ async fn try_route(
                         params[3].parse::<u32>(),
                     ) {
                         // Determine intermediate token address
-                        let intermediate_addr = match intermediate_symbol {
-                            "weth" => WETH.parse()?,
-                            "fleth" => FLETH.parse()?,
-                            _ => return Ok(None), // Unknown intermediate
+                        let intermediate_addr = match resolve_intermediate_address(intermediate_symbol) {
+                            Some(addr) => addr,
+                            None => return Ok(None),
                         };
 
                         // Build V4 pool key for token_in -> intermediate
@@ -329,9 +373,11 @@ async fn try_route(
                             ).await {
                                 return Ok(Some(QuoteResult {
                                     method: method.to_string(),
+                                    display_name: String::new(),
                                     amount_out: v3_quote.amount_out,
                                     gas_estimate: None,
                                     pool_id: None,
+                                    calldata: None,
                                 }));
                             }
                         }
@@ -357,9 +403,11 @@ async fn try_route(
                 {
                     return Ok(Some(QuoteResult {
                         method: "v4-weth-v3".to_string(),
+                        display_name: String::new(),
                         amount_out: out_quote.amount_out,
                         gas_estimate: None,
                         pool_id: None,
+                        calldata: None,
                     }));
                 }
             }
@@ -449,9 +497,11 @@ async fn try_v3_via_weth(
         {
             return Ok(Some(QuoteResult {
                 method: "v3-via-weth".to_string(),
+                display_name: String::new(),
                 amount_out: out_quote.amount_out,
                 gas_estimate: None,
                 pool_id: None,
+                calldata: None,
             }));
         }
     }
@@ -485,7 +535,7 @@ async fn fetch_and_cache_v4_pools(
             poolscout::get_routing_pools_from_list(&pools, token_address)
         }
         Err(e) => {
-            eprintln!("[ERROR] Failed to fetch pools from PoolScout: {}", e);
+            eprintln!("[poolscout] Failed to fetch pools: {}", e);
             Vec::new()
         }
     }
@@ -498,7 +548,6 @@ async fn try_all_routes(
     token_out: Address,
     amount: U256,
 ) -> Result<Vec<QuoteResult>> {
-    let weth_addr: Address = WETH.parse()?;
     let mut quotes = Vec::new();
 
     // Single PoolScout call: fetch all V4 pools for token_in, cache them all
@@ -506,29 +555,25 @@ async fn try_all_routes(
     let v4_routes = fetch_and_cache_v4_pools(token_in).await;
     eprintln!("[TIMING]   - fetch_and_cache_v4_pools (PoolScout): {:?}", dex_start.elapsed());
 
-    // Ensure WETH and flETH are in the routing list as fallbacks
-    let mut all_intermediates: Vec<(Address, Option<poolscout::PoolScoutPool>)> = v4_routes
-        .into_iter()
-        .map(|(addr, pool)| (addr, Some(pool)))
-        .collect();
-
+    // Only use WETH, USDC, and flETH as intermediates for multi-hop
     let weth: Address = WETH.parse().unwrap();
+    let usdc: Address = USDC.parse().unwrap();
     let fleth: Address = FLETH.parse().unwrap();
-    if !all_intermediates.iter().any(|(addr, _)| *addr == weth) {
-        all_intermediates.push((weth, None));
-    }
-    if !all_intermediates.iter().any(|(addr, _)| *addr == fleth) {
-        all_intermediates.push((fleth, None));
-    }
+    let allowed_intermediates = [weth, usdc, fleth];
+
+    let v4_routes_map: std::collections::HashMap<Address, poolscout::PoolScoutPool> =
+        v4_routes.into_iter().collect();
+
+    let all_intermediates: Vec<(Address, Option<poolscout::PoolScoutPool>)> = allowed_intermediates
+        .iter()
+        .map(|&addr| (addr, v4_routes_map.get(&addr).cloned()))
+        .collect();
 
     // Build all route tasks to run in parallel
     let mut route_tasks: Vec<tokio::task::JoinHandle<Vec<QuoteResult>>> = Vec::new();
 
-    // Check if any pool is for the direct pair (token_in -> token_out)
-    let direct_pool = all_intermediates
-        .iter()
-        .find(|(addr, _)| *addr == token_out)
-        .and_then(|(_, pool)| pool.clone());
+    // Check if any PoolScout pool is for the direct pair (token_in -> token_out)
+    let direct_pool = v4_routes_map.get(&token_out).cloned();
 
     // 1. V4 direct (token_in -> token_out)
     let rpc_url_clone = rpc_url.to_string();
@@ -577,18 +622,14 @@ async fn try_all_routes(
 
             if let Some(pool_info) = pool_info_opt {
                 if let Ok(v4_quote) = dex::quote_v4(&rpc_url_clone, token_in, amount, &pool_info).await {
-                    let intermediate_symbol = if intermediate == weth_addr {
-                        "weth"
-                    } else if intermediate == FLETH.parse().unwrap_or(Address::ZERO) {
-                        "fleth"
-                    } else {
-                        "token"
-                    };
+                    let intermediate_symbol = symbol_for_address(intermediate);
+                    let intermediate_symbol_lower = intermediate_symbol.to_lowercase();
 
                     // Try both second legs in parallel
                     let rpc1 = rpc_url_clone.clone();
                     let rpc2 = rpc_url_clone.clone();
                     let v4_out_amount = v4_quote.amount_out;
+                    let leg1_pool_id = v4_quote.pool_id.clone();
 
                     let (v4_v4_result, v4_v3_result) = tokio::join!(
                         // V4 -> V4 (second leg from registry only)
@@ -618,10 +659,16 @@ async fn try_all_routes(
 
                     // Add V4->V4 result
                     if let Some((out_pool, final_quote)) = v4_v4_result {
+                        // Build pool route: leg1_pool -> leg2_pool
+                        let pool_route = match (&leg1_pool_id, &final_quote.pool_id) {
+                            (Some(p1), Some(p2)) => Some(format!("{} -> {}", p1, p2)),
+                            (Some(p1), None) => Some(p1.clone()),
+                            _ => None,
+                        };
                         results.push(QuoteResult {
                             method: format!(
                                 "v4-{}-v4({},{},{},{},{},{})",
-                                intermediate_symbol,
+                                intermediate_symbol_lower,
                                 pool_info.pool_key.fee,
                                 pool_info.pool_key.tick_spacing,
                                 pool_info.pool_key.hooks,
@@ -629,26 +676,32 @@ async fn try_all_routes(
                                 out_pool.pool_key.tick_spacing,
                                 out_pool.pool_key.hooks
                             ),
+                            display_name: String::new(),
                             amount_out: final_quote.amount_out,
                             gas_estimate: None,
-                            pool_id: None,
+                            pool_id: pool_route,
+                            calldata: None,
                         });
                     }
 
                     // Add V4->V3 result
                     if let Some(out_quote) = v4_v3_result {
+                        // For V4->V3, only the V4 leg has a pool ID
+                        let pool_route = leg1_pool_id.clone();
                         results.push(QuoteResult {
                             method: format!(
                                 "v4-{}-v3({},{},{},{})",
-                                intermediate_symbol,
+                                intermediate_symbol_lower,
                                 pool_info.pool_key.fee,
                                 pool_info.pool_key.tick_spacing,
                                 pool_info.pool_key.hooks,
                                 out_quote.method.strip_prefix("v3-direct(").and_then(|s| s.strip_suffix(")")).unwrap_or("3000")
                             ),
+                            display_name: String::new(),
                             amount_out: out_quote.amount_out,
                             gas_estimate: None,
-                            pool_id: None,
+                            pool_id: pool_route,
+                            calldata: None,
                         });
                     }
                 }
@@ -700,6 +753,62 @@ async fn try_all_routes(
     Ok(quotes)
 }
 
+/// Format a route's display name for human-readable output
+fn format_route_display(method: &str, token_in_sym: &str, token_out_sym: &str) -> String {
+    if method.starts_with("v4-direct") {
+        format!("UniV4: {} -> {}", token_in_sym, token_out_sym)
+    } else if method.starts_with("v3-direct") {
+        let fee = method
+            .strip_prefix("v3-direct(")
+            .and_then(|s| s.strip_suffix(")"))
+            .unwrap_or("?");
+        format!("UniV3 ({}bps): {} -> {}", fee_to_bps(fee), token_in_sym, token_out_sym)
+    } else if method.starts_with("aerodrome-") {
+        let pool_type = if method.contains("stable") { "Stable" } else { "Volatile" };
+        format!("Aerodrome {}: {} -> {}", pool_type, token_in_sym, token_out_sym)
+    } else if method.starts_with("v4-") && method.contains("-v4(") {
+        let intermediate = extract_intermediate(method);
+        format!(
+            "UniV4: {} -> {} -> UniV4: {} -> {}",
+            token_in_sym, intermediate, intermediate, token_out_sym
+        )
+    } else if method.starts_with("v4-") && method.contains("-v3(") {
+        let intermediate = extract_intermediate(method);
+        format!(
+            "UniV4: {} -> {} -> UniV3: {} -> {}",
+            token_in_sym, intermediate, intermediate, token_out_sym
+        )
+    } else if method == "v3-via-weth" {
+        format!("UniV3: {} -> WETH -> UniV3: WETH -> {}", token_in_sym, token_out_sym)
+    } else if method.starts_with("v4-weth-v3") {
+        format!("UniV4: {} -> WETH -> UniV3: WETH -> {}", token_in_sym, token_out_sym)
+    } else {
+        format!("{}: {} -> {}", method, token_in_sym, token_out_sym)
+    }
+}
+
+fn fee_to_bps(fee_str: &str) -> String {
+    match fee_str.parse::<u32>() {
+        Ok(fee) => format!("{}", fee / 100),
+        Err(_) => fee_str.to_string(),
+    }
+}
+
+fn extract_intermediate(method: &str) -> String {
+    if let Some(rest) = method.strip_prefix("v4-") {
+        if let Some(idx) = rest.find("-v3(").or_else(|| rest.find("-v4(")) {
+            let sym = &rest[..idx];
+            return match sym {
+                "weth" => "WETH".to_string(),
+                "fleth" => "flETH".to_string(),
+                "usdc" => "USDC".to_string(),
+                other => other.to_uppercase(),
+            };
+        }
+    }
+    "?".to_string()
+}
+
 /// CLI command: quote a swap between two tokens
 pub async fn quote_swap(amount_str: &str, from_str: &str, to_str: &str) -> Result<()> {
     use crate::constants::resolve_token_address;
@@ -709,61 +818,72 @@ pub async fn quote_swap(amount_str: &str, from_str: &str, to_str: &str) -> Resul
     let token_out = resolve_token_address(to_str)
         .ok_or_else(|| anyhow::anyhow!("Invalid token address: {}", to_str))?;
 
-    // Get token metadata to parse amount correctly
     let rpc_url = get_base_rpc();
     let token_in_meta = dex::get_token_metadata(&rpc_url, token_in).await?;
     let token_out_meta = dex::get_token_metadata(&rpc_url, token_out).await?;
 
     let amount_in = dex::parse_token_amount(amount_str, token_in_meta.decimals)?;
 
+    let start = std::time::Instant::now();
     println!(
         "Quoting: {} {} -> {}",
         amount_str, token_in_meta.symbol, token_out_meta.symbol
     );
-    println!();
 
     let result = get_quote(token_in, token_out, amount_in, token_in_meta.decimals).await?;
 
+    let elapsed = start.elapsed();
+    println!();
+
     if !result.quotes.is_empty() {
-        println!("Routes:");
-        for quote in &result.quotes {
+        // Sort quotes by amount_out descending
+        let mut sorted_quotes = result.quotes.clone();
+        sorted_quotes.sort_by(|a, b| b.amount_out.cmp(&a.amount_out));
+
+        println!("Routes found ({} total, {:.1}s):", sorted_quotes.len(), elapsed.as_secs_f64());
+        println!("{}", "-".repeat(60));
+        for (i, quote) in sorted_quotes.iter().enumerate() {
             let amount_out = dex::format_token_amount(quote.amount_out, token_out_meta.decimals);
-            if let Some(ref pid) = quote.pool_id {
-                println!(
-                    "  {}: {} {} (pool: {})",
-                    quote.method, amount_out, token_out_meta.symbol, pid
-                );
-            } else {
-                println!(
-                    "  {}: {} {}",
-                    quote.method, amount_out, token_out_meta.symbol
-                );
-            }
+            let display = format_route_display(&quote.method, &token_in_meta.symbol, &token_out_meta.symbol);
+            let marker = if i == 0 { " *" } else { "" };
+            println!("  {:.6} {} | {}{}", amount_out, token_out_meta.symbol, display, marker);
         }
-        println!();
+        println!("{}", "-".repeat(60));
 
         if let Some(best) = &result.best_quote {
             let best_out = dex::format_token_amount(best.amount_out, token_out_meta.decimals);
-            println!(
-                "Best:  {} {} ({})",
-                best_out, token_out_meta.symbol, best.method
-            );
+            let display = format_route_display(&best.method, &token_in_meta.symbol, &token_out_meta.symbol);
+            println!();
+            println!("Best route: {}", display);
+            println!("  Output:     {:.6} {}", best_out, token_out_meta.symbol);
+            println!("  Method:     {}", best.method);
+
             if let Some(ref pid) = best.pool_id {
-                println!("Pool:  {}", pid);
+                println!("  Pool route: {}", pid);
             }
 
-            // Calculate effective price
+            if let Some(ref gas) = best.gas_estimate {
+                println!("  Gas est:    {}", gas);
+            }
+
+            // Effective price
             let amount_in_f64 = dex::format_token_amount(amount_in, token_in_meta.decimals);
             let effective_price = best_out / amount_in_f64;
             println!(
-                "Price: 1 {} = {:.6} {}",
+                "  Price:    1 {} = {:.6} {}",
                 token_in_meta.symbol, effective_price, token_out_meta.symbol
             );
+
+            if let Some(ref cd) = best.calldata {
+                println!();
+                println!("Calldata:");
+                println!("  {}", cd);
+            }
         }
     } else {
         println!(
-            "No routes found between {} and {}",
-            token_in_meta.symbol, token_out_meta.symbol
+            "No routes found between {} and {} ({:.1}s)",
+            token_in_meta.symbol, token_out_meta.symbol, elapsed.as_secs_f64()
         );
         println!("This pair may not have active liquidity pools.");
     }

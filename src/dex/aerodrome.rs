@@ -45,9 +45,11 @@ pub async fn quote_aerodrome(
             if amounts.amounts.len() >= 2 && amounts.amounts[1] > U256::ZERO {
                 Ok(QuoteResult {
                     method: format!("aerodrome-{}", if stable { "stable" } else { "volatile" }),
+                    display_name: String::new(),
                     amount_out: amounts.amounts[1],
                     gas_estimate: None,
                     pool_id: None,
+                    calldata: None,
                 })
             } else {
                 anyhow::bail!("Aerodrome returned zero output");

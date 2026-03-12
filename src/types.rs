@@ -45,10 +45,12 @@ pub struct V4PoolInfo {
 
 #[derive(Debug, Clone)]
 pub struct QuoteResult {
-    pub method: String,
+    pub method: String,          // Internal route key for caching (e.g. "v4-direct(8388608,200,0xbb...)")
+    pub display_name: String,    // Human-readable route (e.g. "UniV4: MESH -> WETH")
     pub amount_out: U256,
     pub gas_estimate: Option<U256>,
     pub pool_id: Option<String>, // V4 pool ID (0x-prefixed hex) for pool lookup
+    pub calldata: Option<String>, // Hex-encoded calldata for execution
 }
 
 #[derive(Debug, Clone)]

@@ -28,24 +28,32 @@ fn mock_quotes() -> Vec<QuoteResult> {
         amount_out: U256::from(1000000),
         gas_estimate: None,
         pool_id: None,
+        display_name: String::new(),
+        calldata: None,
     },
     QuoteResult {
         method: "aerodrome-stable".to_string(),
         amount_out: U256::from(999500), // 0.05% worse
         gas_estimate: None,
         pool_id: None,
+        display_name: String::new(),
+        calldata: None,
     },
     QuoteResult {
         method: "v3-direct(3000)".to_string(),
         amount_out: U256::from(999000), // 0.1% worse
         gas_estimate: None,
         pool_id: None,
+        display_name: String::new(),
+        calldata: None,
     },
     QuoteResult {
         method: "v3-via-weth".to_string(),
         amount_out: U256::from(990000), // 1% worse - should be filtered out
         gas_estimate: None,
         pool_id: None,
+        display_name: String::new(),
+        calldata: None,
     },
     ]
 }

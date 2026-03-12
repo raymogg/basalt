@@ -2,6 +2,7 @@ mod cache;
 mod constants;
 mod dex;
 mod dexscreener;
+mod poolscout;
 mod quote;
 mod types;
 

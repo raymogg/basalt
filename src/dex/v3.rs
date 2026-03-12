@@ -50,6 +50,7 @@ pub async fn quote_v3(
             method: format!("v3-direct({})", fee),
             amount_out: result.amountOut,
             gas_estimate: Some(result.gasEstimate),
+            pool_id: None,
         }),
         Err(e) => {
             anyhow::bail!("V3 quote failed: {}", e);

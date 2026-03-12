@@ -1,7 +1,7 @@
 use crate::cache;
 use crate::constants::{get_base_rpc, V3_FEES, WETH, FLETH};
 use crate::dex;
-use crate::dexscreener;
+use crate::poolscout;
 use crate::types::{FullQuoteResult, QuoteResult};
 use alloy::primitives::{Address, U256};
 use anyhow::Result;
@@ -257,6 +257,7 @@ async fn try_route(
                                     method: method.to_string(),
                                     amount_out: v4_quote2.amount_out,
                                     gas_estimate: None,
+                                    pool_id: None,
                                 }));
                             }
                         }
@@ -330,6 +331,7 @@ async fn try_route(
                                     method: method.to_string(),
                                     amount_out: v3_quote.amount_out,
                                     gas_estimate: None,
+                                    pool_id: None,
                                 }));
                             }
                         }
@@ -357,6 +359,7 @@ async fn try_route(
                         method: "v4-weth-v3".to_string(),
                         amount_out: out_quote.amount_out,
                         gas_estimate: None,
+                        pool_id: None,
                     }));
                 }
             }
@@ -448,6 +451,7 @@ async fn try_v3_via_weth(
                 method: "v3-via-weth".to_string(),
                 amount_out: out_quote.amount_out,
                 gas_estimate: None,
+                pool_id: None,
             }));
         }
     }
@@ -455,83 +459,36 @@ async fn try_v3_via_weth(
     Ok(None)
 }
 
-/// Get V4 routing info from DexScreener (quote tokens, pool IDs, and creation block hints)
-async fn get_v4_routing_info(
-    rpc_url: &str,
+/// Fetch all V4 pools for a token from PoolScout (single API call),
+/// cache every pool into the persistent registry and in-memory cache,
+/// and return routing info derived from that list.
+async fn fetch_and_cache_v4_pools(
     token_address: Address,
-) -> Vec<(Address, Option<[u8; 32]>, Option<u64>)> {
-    let mut routes = Vec::new();
-
-    // Try to get V4 pairs from DexScreener
-    match dexscreener::get_v4_pairs(token_address).await {
-        Ok(pairs) => {
-            // Get current block and timestamp for block estimation
-            use alloy::providers::Provider;
-            match rpc_url.parse::<reqwest::Url>() {
-                Ok(rpc_url_parsed) => {
-                    let provider = alloy::providers::ProviderBuilder::new().on_http(rpc_url_parsed);
-
-                    let block_result = provider.get_block_number().await;
-                    let latest_block_result = provider.get_block_by_number(
-                        alloy::rpc::types::BlockNumberOrTag::Latest,
-                        alloy::rpc::types::BlockTransactionsKind::Hashes,
-                    ).await;
-
-                    match (block_result, latest_block_result) {
-                        (Ok(current_block), Ok(Some(latest_block_data))) => {
-                            let current_timestamp: u64 = latest_block_data.header.timestamp;
-
-                            for pair in pairs.iter() {
-                                // Parse quote token address, pool ID, and estimate creation block
-                                match pair.quote_token_address() {
-                                    Some(quote_addr) => {
-                                        let pool_id = pair.pool_id();
-                                        let creation_block = pair.estimate_creation_block(current_block, current_timestamp);
-
-                                        // Only add if not already in list
-                                        if !routes.iter().any(|(addr, _, _)| *addr == quote_addr) {
-                                            routes.push((quote_addr, pool_id, creation_block));
-                                        }
-                                    }
-                                    None => {
-                                        eprintln!("[ERROR] Failed to parse quote token address from DexScreener pair");
-                                    }
-                                }
-                            }
-                        }
-                        (Err(e), _) => {
-                            eprintln!("[ERROR] Failed to get current block number: {}", e);
-                        }
-                        (_, Err(e)) => {
-                            eprintln!("[ERROR] Failed to get latest block data: {}", e);
-                        }
-                        (_, Ok(None)) => {
-                            eprintln!("[ERROR] Latest block returned None");
+) -> Vec<(Address, poolscout::PoolScoutPool)> {
+    match poolscout::get_pools_by_token(token_address).await {
+        Ok(pools) => {
+            // Cache every discovered pool into the persistent registry + in-memory
+            for pool in &pools {
+                if pool.is_active() {
+                    if let Some(other) = pool.other_token(token_address) {
+                        if let Ok(pool_info) = pool.to_pool_info(token_address, other) {
+                            cache::cache_pool(
+                                cache::pool_cache_key(token_address, other),
+                                pool_info,
+                            );
                         }
                     }
                 }
-                Err(e) => {
-                    eprintln!("[ERROR] Failed to parse RPC URL '{}': {}", rpc_url, e);
-                }
             }
+
+            // Build routing info from the pool list
+            poolscout::get_routing_pools_from_list(&pools, token_address)
         }
         Err(e) => {
-            eprintln!("[ERROR] Failed to fetch V4 pairs from DexScreener: {}", e);
+            eprintln!("[ERROR] Failed to fetch pools from PoolScout: {}", e);
+            Vec::new()
         }
     }
-
-    // Always include WETH and flETH as fallback even if DexScreener doesn't report them
-    let weth: Address = WETH.parse().unwrap();
-    let fleth: Address = FLETH.parse().unwrap();
-
-    if !routes.iter().any(|(addr, _, _)| *addr == weth) {
-        routes.push((weth, None, None));
-    }
-    if !routes.iter().any(|(addr, _, _)| *addr == fleth) {
-        routes.push((fleth, None, None));
-    }
-
-    routes
 }
 
 /// Try all routes in parallel and return all successful quotes
@@ -544,40 +501,61 @@ async fn try_all_routes(
     let weth_addr: Address = WETH.parse()?;
     let mut quotes = Vec::new();
 
-    // Get all V4 routing info (quote tokens + pool IDs + block hints) from DexScreener
+    // Single PoolScout call: fetch all V4 pools for token_in, cache them all
     let dex_start = std::time::Instant::now();
-    let v4_routes = get_v4_routing_info(rpc_url, token_in).await;
-    eprintln!("[TIMING]   - get_v4_routing_info (DexScreener): {:?}", dex_start.elapsed());
+    let v4_routes = fetch_and_cache_v4_pools(token_in).await;
+    eprintln!("[TIMING]   - fetch_and_cache_v4_pools (PoolScout): {:?}", dex_start.elapsed());
+
+    // Ensure WETH and flETH are in the routing list as fallbacks
+    let mut all_intermediates: Vec<(Address, Option<poolscout::PoolScoutPool>)> = v4_routes
+        .into_iter()
+        .map(|(addr, pool)| (addr, Some(pool)))
+        .collect();
+
+    let weth: Address = WETH.parse().unwrap();
+    let fleth: Address = FLETH.parse().unwrap();
+    if !all_intermediates.iter().any(|(addr, _)| *addr == weth) {
+        all_intermediates.push((weth, None));
+    }
+    if !all_intermediates.iter().any(|(addr, _)| *addr == fleth) {
+        all_intermediates.push((fleth, None));
+    }
 
     // Build all route tasks to run in parallel
     let mut route_tasks: Vec<tokio::task::JoinHandle<Vec<QuoteResult>>> = Vec::new();
 
-    // Check if any DexScreener route is for the direct pool (token_in -> token_out)
-    let direct_pool_info = v4_routes
+    // Check if any pool is for the direct pair (token_in -> token_out)
+    let direct_pool = all_intermediates
         .iter()
-        .find(|(intermediate, _, _)| *intermediate == token_out)
-        .map(|(_, pool_id, block_hint)| (*pool_id, *block_hint));
+        .find(|(addr, _)| *addr == token_out)
+        .and_then(|(_, pool)| pool.clone());
 
     // 1. V4 direct (token_in -> token_out)
     let rpc_url_clone = rpc_url.to_string();
     route_tasks.push(tokio::spawn(async move {
-        if let Ok(Some(pool_info)) = dex::v4::discover_v4_pool_key_with_target(
-            &rpc_url_clone,
-            token_in,
-            token_out,
-            direct_pool_info.and_then(|(id, _)| id),
-            direct_pool_info.and_then(|(_, hint)| hint),
-        ).await {
-            if let Ok(v4_quote) = dex::quote_v4(&rpc_url_clone, token_in, amount, &pool_info).await {
-                return vec![v4_quote];
+        // Pool was already cached by fetch_and_cache_v4_pools if it exists
+        if let Some(pool) = direct_pool {
+            if let Ok(pool_info) = pool.to_pool_info(token_in, token_out) {
+                if let Ok(v4_quote) = dex::quote_v4(&rpc_url_clone, token_in, amount, &pool_info).await {
+                    return vec![v4_quote];
+                }
+            }
+        } else {
+            // Check registry (may have been cached from a previous run)
+            if let Ok(Some(pool_info)) = dex::v4::discover_v4_pool_key(
+                &rpc_url_clone, token_in, token_out,
+            ).await {
+                if let Ok(v4_quote) = dex::quote_v4(&rpc_url_clone, token_in, amount, &pool_info).await {
+                    return vec![v4_quote];
+                }
             }
         }
         vec![]
     }));
 
     // 2. V4 multi-hop routes (all in parallel)
-    for (intermediate, pool_id, creation_block) in v4_routes {
-        // Skip if intermediate is the same as output
+    for (intermediate, pool) in all_intermediates {
+        // Skip if intermediate is the same as output (handled as direct above)
         if intermediate == token_out {
             continue;
         }
@@ -586,16 +564,18 @@ async fn try_all_routes(
         route_tasks.push(tokio::spawn(async move {
             let mut results = Vec::new();
 
-            // Try token_in -> intermediate via V4
-            if let Ok(Some(pool_info)) = dex::v4::discover_v4_pool_key_with_target(
-                &rpc_url_clone,
-                token_in,
-                intermediate,
-                pool_id,
-                creation_block,
-            )
-            .await
-            {
+            // First leg: token_in -> intermediate via V4
+            // Pool info is already in-memory cache from fetch_and_cache_v4_pools,
+            // or we fall back to registry for WETH/flETH fallbacks
+            let pool_info_opt = if let Some(ref p) = pool {
+                p.to_pool_info(token_in, intermediate).ok()
+            } else {
+                // WETH/flETH fallback — check registry only, no PoolScout call
+                dex::v4::discover_v4_pool_key(&rpc_url_clone, token_in, intermediate)
+                    .await.ok().flatten()
+            };
+
+            if let Some(pool_info) = pool_info_opt {
                 if let Ok(v4_quote) = dex::quote_v4(&rpc_url_clone, token_in, amount, &pool_info).await {
                     let intermediate_symbol = if intermediate == weth_addr {
                         "weth"
@@ -611,7 +591,7 @@ async fn try_all_routes(
                     let v4_out_amount = v4_quote.amount_out;
 
                     let (v4_v4_result, v4_v3_result) = tokio::join!(
-                        // V4 -> V4
+                        // V4 -> V4 (second leg from registry only)
                         async {
                             if let Ok(Some(out_pool)) =
                                 dex::discover_v4_pool_key(&rpc1, intermediate, token_out).await
@@ -629,7 +609,6 @@ async fn try_all_routes(
                             if let Ok(Some(out_quote)) =
                                 get_best_v3_quote_cached(&rpc2, intermediate, token_out, v4_out_amount).await
                             {
-                                // Cache intermediate leg
                                 let _ = cache::cache_routes(intermediate, token_out, &[out_quote.clone()]);
                                 return Some(out_quote);
                             }
@@ -652,6 +631,7 @@ async fn try_all_routes(
                             ),
                             amount_out: final_quote.amount_out,
                             gas_estimate: None,
+                            pool_id: None,
                         });
                     }
 
@@ -668,6 +648,7 @@ async fn try_all_routes(
                             ),
                             amount_out: out_quote.amount_out,
                             gas_estimate: None,
+                            pool_id: None,
                         });
                     }
                 }
@@ -747,10 +728,17 @@ pub async fn quote_swap(amount_str: &str, from_str: &str, to_str: &str) -> Resul
         println!("Routes:");
         for quote in &result.quotes {
             let amount_out = dex::format_token_amount(quote.amount_out, token_out_meta.decimals);
-            println!(
-                "  {}: {} {}",
-                quote.method, amount_out, token_out_meta.symbol
-            );
+            if let Some(ref pid) = quote.pool_id {
+                println!(
+                    "  {}: {} {} (pool: {})",
+                    quote.method, amount_out, token_out_meta.symbol, pid
+                );
+            } else {
+                println!(
+                    "  {}: {} {}",
+                    quote.method, amount_out, token_out_meta.symbol
+                );
+            }
         }
         println!();
 
@@ -760,6 +748,9 @@ pub async fn quote_swap(amount_str: &str, from_str: &str, to_str: &str) -> Resul
                 "Best:  {} {} ({})",
                 best_out, token_out_meta.symbol, best.method
             );
+            if let Some(ref pid) = best.pool_id {
+                println!("Pool:  {}", pid);
+            }
 
             // Calculate effective price
             let amount_in_f64 = dex::format_token_amount(amount_in, token_in_meta.decimals);

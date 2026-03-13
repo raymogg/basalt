@@ -3,7 +3,7 @@ use crate::types::{TokenBalance, TokenMetadata};
 use alloy::primitives::{Address, U256};
 use alloy::providers::ProviderBuilder;
 use alloy::sol;
-use alloy::transports::http::reqwest;
+
 use anyhow::Result;
 
 // ERC20 interface
@@ -30,12 +30,12 @@ pub async fn get_token_metadata(rpc_url: &str, token_address: Address) -> Result
     }
 
     // Fetch from on-chain
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let token = IERC20::new(token_address, provider);
 
-    let decimals = token.decimals().call().await?._0;
-    let symbol = token.symbol().call().await?._0;
-    let name = token.name().call().await?._0;
+    let decimals = token.decimals().call().await?;
+    let symbol = token.symbol().call().await?;
+    let name = token.name().call().await?;
 
     let metadata = TokenMetadata {
         address: token_address,
@@ -58,14 +58,14 @@ pub async fn get_token_balance(
 ) -> Result<TokenBalance> {
     let metadata = get_token_metadata(rpc_url, token_address).await?;
 
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let token = IERC20::new(token_address, provider);
 
     let balance_result = token.balanceOf(wallet).call().await?;
 
     Ok(TokenBalance {
         metadata,
-        balance: balance_result._0,
+        balance: balance_result,
     })
 }
 

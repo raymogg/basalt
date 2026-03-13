@@ -74,7 +74,7 @@ async fn try_registry_pools(
 
     eprintln!("[v4] Checking {} cached pool(s) from registry", known_pools.len());
 
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let state_view = IStateView::new(V4_STATE_VIEW.parse()?, provider);
 
     for pool_key in known_pools {
@@ -82,11 +82,10 @@ async fn try_registry_pools(
         match state_view.getSlot0(pool_id.into()).call().await {
             Ok(slot0) => {
                 if slot0.sqrtPriceX96 > alloy::primitives::Uint::<160, 3>::ZERO {
-                    let liquidity = state_view
+                    let liquidity: u128 = state_view
                         .getLiquidity(pool_id.into())
                         .call()
                         .await
-                        .map(|l| l.liquidity)
                         .unwrap_or(0);
 
                     eprintln!("[v4] Registry hit: fee={}, tick={}, hooks={:.8}..., liq={}",
@@ -147,7 +146,7 @@ pub async fn quote_v4(
     amount: U256,
     pool_info: &V4PoolInfo,
 ) -> Result<QuoteResult> {
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let quoter = IV4Quoter::new(V4_QUOTER.parse()?, provider);
 
     let params = IV4Quoter::QuoteParams {

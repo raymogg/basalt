@@ -20,6 +20,13 @@ impl Wallet {
         Ok(Self { address, ethereum_wallet })
     }
 
+    /// Create wallet directly from a signer (useful for testing with Anvil keys)
+    pub fn from_signer(signer: PrivateKeySigner) -> Self {
+        let address = signer.address();
+        let ethereum_wallet = EthereumWallet::from(signer);
+        Self { address, ethereum_wallet }
+    }
+
     /// Get a clone of the EthereumWallet for use with ProviderBuilder
     pub fn ethereum_wallet(&self) -> EthereumWallet {
         self.ethereum_wallet.clone()

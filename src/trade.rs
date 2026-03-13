@@ -128,7 +128,7 @@ pub async fn execute_swap(
 }
 
 /// Ensure ERC20 approval to Permit2 and Permit2 approval to the Universal Router.
-async fn ensure_approvals(
+pub async fn ensure_approvals(
     rpc_url: &str,
     wallet: &Wallet,
     token: Address,

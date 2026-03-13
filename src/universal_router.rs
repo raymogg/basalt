@@ -73,13 +73,13 @@ fn encode_v4_single_swap_to_sender(
         amount_in,
         min_amount_out,
         Bytes::new(), // hookData
-    ).abi_encode();
+    ).abi_encode_params();
 
     // param 1: SETTLE_ALL(currency_in, maxAmount)
-    let settle_params = (currency_in, u128::MAX).abi_encode();
+    let settle_params = (currency_in, u128::MAX).abi_encode_params();
 
     // param 2: TAKE_ALL(currency_out, minAmount)
-    let take_params = (currency_out, min_amount_out).abi_encode();
+    let take_params = (currency_out, min_amount_out).abi_encode_params();
 
     let params: Vec<Bytes> = vec![
         Bytes::from(swap_params),
@@ -88,7 +88,7 @@ fn encode_v4_single_swap_to_sender(
     ];
 
     // V4_SWAP input = abi.encode(actions, params)
-    (Bytes::from(actions), params).abi_encode()
+    (Bytes::from(actions), params).abi_encode_params()
 }
 
 /// Build V4 swap input bytes for a single-hop swap where output stays in the router
@@ -119,13 +119,13 @@ fn encode_v4_single_swap_to_router(
         amount_in,
         0u128, // amountOutMinimum = 0 for intermediate step
         Bytes::new(), // hookData
-    ).abi_encode();
+    ).abi_encode_params();
 
     // param 1: SETTLE_ALL(currency_in, maxAmount)
-    let settle_params = (currency_in, u128::MAX).abi_encode();
+    let settle_params = (currency_in, u128::MAX).abi_encode_params();
 
     // param 2: TAKE(currency_out, recipient=ADDRESS_THIS, minAmount=0)
-    let take_params = (currency_out, ADDRESS_THIS, U256::ZERO).abi_encode();
+    let take_params = (currency_out, ADDRESS_THIS, U256::ZERO).abi_encode_params();
 
     let params: Vec<Bytes> = vec![
         Bytes::from(swap_params),
@@ -133,7 +133,7 @@ fn encode_v4_single_swap_to_router(
         Bytes::from(take_params),
     ];
 
-    (Bytes::from(actions), params).abi_encode()
+    (Bytes::from(actions), params).abi_encode_params()
 }
 
 /// Build V3_SWAP_EXACT_IN input where tokens come from msg.sender
@@ -145,7 +145,7 @@ fn encode_v3_swap_from_sender(
     min_amount_out: U256,
 ) -> Vec<u8> {
     let path = encode_v3_path(token_in, fee, token_out);
-    (MSG_SENDER, amount_in, min_amount_out, Bytes::from(path), true).abi_encode()
+    (MSG_SENDER, amount_in, min_amount_out, Bytes::from(path), true).abi_encode_params()
 }
 
 /// Build V3_SWAP_EXACT_IN input where tokens are already in the router (from a previous swap)
@@ -156,7 +156,7 @@ fn encode_v3_swap_from_router(
     min_amount_out: U256,
 ) -> Vec<u8> {
     let path = encode_v3_path(token_in, fee, token_out);
-    (MSG_SENDER, contract_balance(), min_amount_out, Bytes::from(path), false).abi_encode()
+    (MSG_SENDER, contract_balance(), min_amount_out, Bytes::from(path), false).abi_encode_params()
 }
 
 /// Encode a full Universal Router execute() calldata for a V4 single-hop swap

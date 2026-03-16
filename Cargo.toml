@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # Ethereum interaction
-alloy = { version = "0.8", features = ["full", "node-bindings", "rpc-types-eth", "rpc-types-trace"] }
+alloy = { version = "1.7.3", features = ["full", "node-bindings", "rpc-types-eth", "rpc-types-trace"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

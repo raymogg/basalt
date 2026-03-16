@@ -14,6 +14,25 @@ sol! {
     }
 }
 
+// V4 Router types — must match Uniswap's IV4Router exactly for correct ABI encoding
+sol! {
+    struct PoolKey {
+        address currency0;
+        address currency1;
+        uint24 fee;
+        int24 tickSpacing;
+        address hooks;
+    }
+
+    struct ExactInputSingleParams {
+        PoolKey poolKey;
+        bool zeroForOne;
+        uint128 amountIn;
+        uint128 amountOutMinimum;
+        bytes hookData;
+    }
+}
+
 // Command bytes
 const V3_SWAP_EXACT_IN: u8 = 0x00;
 const V4_SWAP: u8 = 0x10;
@@ -60,26 +79,27 @@ fn encode_v4_single_swap_to_sender(
         (pool_key.currency1, pool_key.currency0)
     };
 
-    // param 0: ExactInputSingleParams
-    let swap_params = (
-        (
-            pool_key.currency0,
-            pool_key.currency1,
-            pool_key.fee_as_u24(),
-            pool_key.tick_spacing_as_i24(),
-            pool_key.hooks,
-        ),
-        zero_for_one,
-        amount_in,
-        min_amount_out,
-        Bytes::new(), // hookData
-    ).abi_encode();
+    // param 0: ExactInputSingleParams — must use abi_encode() (not abi_encode_params)
+    // because the router reads the first word as an offset to the struct data
+    let swap_params = ExactInputSingleParams {
+        poolKey: PoolKey {
+            currency0: pool_key.currency0,
+            currency1: pool_key.currency1,
+            fee: pool_key.fee_as_u24(),
+            tickSpacing: pool_key.tick_spacing_as_i24(),
+            hooks: pool_key.hooks,
+        },
+        zeroForOne: zero_for_one,
+        amountIn: amount_in,
+        amountOutMinimum: min_amount_out,
+        hookData: Bytes::new(),
+    }.abi_encode();
 
     // param 1: SETTLE_ALL(currency_in, maxAmount)
-    let settle_params = (currency_in, u128::MAX).abi_encode();
+    let settle_params = (currency_in, U256::MAX).abi_encode_params();
 
     // param 2: TAKE_ALL(currency_out, minAmount)
-    let take_params = (currency_out, min_amount_out).abi_encode();
+    let take_params = (currency_out, U256::from(min_amount_out)).abi_encode_params();
 
     let params: Vec<Bytes> = vec![
         Bytes::from(swap_params),
@@ -88,7 +108,7 @@ fn encode_v4_single_swap_to_sender(
     ];
 
     // V4_SWAP input = abi.encode(actions, params)
-    (Bytes::from(actions), params).abi_encode()
+    (Bytes::from(actions), params).abi_encode_params()
 }
 
 /// Build V4 swap input bytes for a single-hop swap where output stays in the router
@@ -106,26 +126,26 @@ fn encode_v4_single_swap_to_router(
         (pool_key.currency1, pool_key.currency0)
     };
 
-    // param 0: ExactInputSingleParams
-    let swap_params = (
-        (
-            pool_key.currency0,
-            pool_key.currency1,
-            pool_key.fee_as_u24(),
-            pool_key.tick_spacing_as_i24(),
-            pool_key.hooks,
-        ),
-        zero_for_one,
-        amount_in,
-        0u128, // amountOutMinimum = 0 for intermediate step
-        Bytes::new(), // hookData
-    ).abi_encode();
+    // param 0: ExactInputSingleParams — must use abi_encode() (not abi_encode_params)
+    let swap_params = ExactInputSingleParams {
+        poolKey: PoolKey {
+            currency0: pool_key.currency0,
+            currency1: pool_key.currency1,
+            fee: pool_key.fee_as_u24(),
+            tickSpacing: pool_key.tick_spacing_as_i24(),
+            hooks: pool_key.hooks,
+        },
+        zeroForOne: zero_for_one,
+        amountIn: amount_in,
+        amountOutMinimum: 0u128,
+        hookData: Bytes::new(),
+    }.abi_encode();
 
-    // param 1: SETTLE_ALL(currency_in, maxAmount)
-    let settle_params = (currency_in, u128::MAX).abi_encode();
+    // param 1: SETTLE_ALL(currency_in, maxAmount) — maxAmount is uint256
+    let settle_params = (currency_in, U256::MAX).abi_encode_params();
 
-    // param 2: TAKE(currency_out, recipient=ADDRESS_THIS, minAmount=0)
-    let take_params = (currency_out, ADDRESS_THIS, U256::ZERO).abi_encode();
+    // param 2: TAKE(currency_out, recipient=ADDRESS_THIS, amount=0)
+    let take_params = (currency_out, ADDRESS_THIS, U256::ZERO).abi_encode_params();
 
     let params: Vec<Bytes> = vec![
         Bytes::from(swap_params),
@@ -133,7 +153,7 @@ fn encode_v4_single_swap_to_router(
         Bytes::from(take_params),
     ];
 
-    (Bytes::from(actions), params).abi_encode()
+    (Bytes::from(actions), params).abi_encode_params()
 }
 
 /// Build V3_SWAP_EXACT_IN input where tokens come from msg.sender
@@ -145,7 +165,7 @@ fn encode_v3_swap_from_sender(
     min_amount_out: U256,
 ) -> Vec<u8> {
     let path = encode_v3_path(token_in, fee, token_out);
-    (MSG_SENDER, amount_in, min_amount_out, Bytes::from(path), true).abi_encode()
+    (MSG_SENDER, amount_in, min_amount_out, Bytes::from(path), true).abi_encode_params()
 }
 
 /// Build V3_SWAP_EXACT_IN input where tokens are already in the router (from a previous swap)
@@ -156,7 +176,7 @@ fn encode_v3_swap_from_router(
     min_amount_out: U256,
 ) -> Vec<u8> {
     let path = encode_v3_path(token_in, fee, token_out);
-    (MSG_SENDER, contract_balance(), min_amount_out, Bytes::from(path), false).abi_encode()
+    (MSG_SENDER, contract_balance(), min_amount_out, Bytes::from(path), false).abi_encode_params()
 }
 
 /// Encode a full Universal Router execute() calldata for a V4 single-hop swap

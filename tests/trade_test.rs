@@ -46,15 +46,22 @@ fn spawn_fork_anvil() -> AnvilInstance {
     Anvil::new().fork(rpc).spawn()
 }
 
-/// Fund test wallet with USDC by impersonating a whale.
-async fn fund_with_usdc(
+/// Fund test wallet with an ERC20 token by impersonating a whale.
+async fn fund_with_token(
     provider: &impl Provider,
-    _rpc_url: &str,
+    token: Address,
+    whale: Address,
     recipient: Address,
     amount: U256,
 ) {
-    let whale: Address = USDC_WHALE.parse().unwrap();
-    let usdc: Address = USDC.parse().unwrap();
+    // Give whale ETH for gas (in case they don't have any)
+    provider
+        .raw_request::<_, ()>(
+            "anvil_setBalance".into(),
+            &(whale, U256::from(10u64).pow(U256::from(18u64))), // 1 ETH
+        )
+        .await
+        .expect("setBalance failed");
 
     // Impersonate the whale
     provider
@@ -72,12 +79,12 @@ async fn fund_with_usdc(
     // Send transfer as the whale (using a plain provider, no wallet needed for impersonated accounts)
     let tx = alloy::rpc::types::TransactionRequest::default()
         .from(whale)
-        .to(usdc)
+        .to(token)
         .input(Bytes::from(calldata).into());
 
     let pending = provider.send_transaction(tx).await.expect("transfer tx failed");
     let receipt = pending.get_receipt().await.expect("transfer receipt failed");
-    assert!(receipt.status(), "USDC transfer from whale should succeed");
+    assert!(receipt.status(), "token transfer from whale should succeed");
 
     // Stop impersonating
     provider
@@ -86,9 +93,9 @@ async fn fund_with_usdc(
         .expect("stop impersonating failed");
 
     // Verify balance
-    let erc20 = IERC20::new(usdc, provider);
+    let erc20 = IERC20::new(token, provider);
     let balance = erc20.balanceOf(recipient).call().await.expect("balanceOf failed");
-    assert!(balance >= amount, "recipient should have at least {amount} USDC");
+    assert!(balance >= amount, "recipient should have at least {amount} tokens");
 }
 
 #[tokio::test]
@@ -103,7 +110,7 @@ async fn fork_test_erc20_approval_to_permit2() {
 
     // Fund wallet with a small amount of USDC (needed so the approval path runs)
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
-    fund_with_usdc(&provider, &anvil.endpoint(), wallet.address, U256::from(1_000_000u64)).await;
+    fund_with_token(&provider, usdc, USDC_WHALE.parse().unwrap(), wallet.address, U256::from(1_000_000u64)).await;
 
     // Run ensure_approvals
     basalt::trade::ensure_approvals(&anvil.endpoint(), &wallet, usdc, "USDC")
@@ -128,7 +135,7 @@ async fn fork_test_permit2_approval_to_router() {
     let router: Address = UNIVERSAL_ROUTER.parse().unwrap();
 
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
-    fund_with_usdc(&provider, &anvil.endpoint(), wallet.address, U256::from(1_000_000u64)).await;
+    fund_with_token(&provider, usdc, USDC_WHALE.parse().unwrap(), wallet.address, U256::from(1_000_000u64)).await;
 
     basalt::trade::ensure_approvals(&anvil.endpoint(), &wallet, usdc, "USDC")
         .await
@@ -169,7 +176,7 @@ async fn fork_test_approvals_are_idempotent() {
     let usdc: Address = USDC.parse().unwrap();
 
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
-    fund_with_usdc(&provider, &anvil.endpoint(), wallet.address, U256::from(1_000_000u64)).await;
+    fund_with_token(&provider, usdc, USDC_WHALE.parse().unwrap(), wallet.address, U256::from(1_000_000u64)).await;
 
     // First call sets approvals
     basalt::trade::ensure_approvals(&anvil.endpoint(), &wallet, usdc, "USDC")
@@ -202,7 +209,7 @@ async fn fork_test_full_swap_usdc_to_weth() {
 
     // Fund wallet with 1 USDC (1_000_000 = 1e6)
     let amount_in = U256::from(1_000_000u64);
-    fund_with_usdc(&provider, &anvil.endpoint(), wallet.address, amount_in).await;
+    fund_with_token(&provider, usdc, USDC_WHALE.parse().unwrap(), wallet.address, amount_in).await;
 
     // Ensure approvals (ERC20 → Permit2 → Router)
     basalt::trade::ensure_approvals(&anvil.endpoint(), &wallet, usdc, "USDC")
@@ -253,5 +260,105 @@ async fn fork_test_full_swap_usdc_to_weth() {
     let weth_contract = IWETH::new(weth, &provider);
     let weth_balance = weth_contract.balanceOf(wallet.address).call().await.unwrap();
     assert!(weth_balance > U256::ZERO, "should have received WETH from swap");
+}
+
+/// End-to-end V4 swap test: sell ROBOTMONEY for WETH via V4 pool with hooks.
+///
+/// Pool: WETH/ROBOTMONEY, fee=8388608 (dynamic), tickSpacing=200,
+///       hooks=0xbb7784a4d481184283ed89619a3e3ed143e1adc0
+///       poolId=0xcece56fd6eb8fcbc6c45af8181bfe71ea6057770630490cac36dbbc4aa27a4a6
+/// Direction: selling ROBOTMONEY (currency1) for WETH (currency0) → zero_for_one = false
+#[tokio::test]
+#[ignore]
+async fn fork_test_v4_swap_to_weth() {
+    let anvil = spawn_fork_anvil();
+    let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let wallet = Wallet::from_signer(signer);
+
+    let weth: Address = "0x4200000000000000000000000000000000000006".parse().unwrap();
+    let token: Address = "0x65021a79AeEF22b17cdc1B768f5e79a8618bEbA3".parse().unwrap();
+    let router: Address = UNIVERSAL_ROUTER.parse().unwrap();
+
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
+
+    let whale: Address = "0xfbc2cc30f0674ed0244ee1f0ba7864423230c9d6".parse().unwrap();
+
+    // Fund wallet with 1 token (18 decimals)
+    let amount_in = U256::from(10u64).pow(U256::from(18u64));
+    fund_with_token(&provider, token, whale, wallet.address, amount_in).await;
+
+    // Ensure approvals (ERC20 → Permit2 → Router)
+    basalt::trade::ensure_approvals(&anvil.endpoint(), &wallet, token, "ROBOTMONEY")
+        .await
+        .expect("ensure_approvals should succeed");
+
+    // Use the V4 pool with dynamic fee and hooks (highest liquidity)
+    // poolId: 0xcece56fd6eb8fcbc6c45af8181bfe71ea6057770630490cac36dbbc4aa27a4a6
+    let pool_key = basalt::types::V4PoolKey {
+        currency0: weth,
+        currency1: token,
+        fee: 8388608,      // dynamic fee flag
+        tick_spacing: 200,
+        hooks: "0xbb7784a4d481184283ed89619a3e3ed143e1adc0".parse().unwrap(),
+    };
+
+    let pool_info = basalt::types::V4PoolInfo {
+        pool_key: pool_key.clone(),
+        pool_id: [0u8; 32],
+        sqrt_price_x96: alloy::primitives::Uint::<160, 3>::ZERO,
+        liquidity: 0,
+        zero_for_one: false, // selling currency1 (token) for currency0 (WETH)
+    };
+
+    // Verify pool is quotable
+    let quote = basalt::dex::v4::quote_v4(&anvil.endpoint(), token, amount_in, &pool_info)
+        .await
+        .expect("V4 quoter should return a quote — pool must be active");
+    eprintln!("[test] V4 quote: 1 ROBOTMONEY -> {} WETH (raw)", quote.amount_out);
+    assert!(quote.amount_out > U256::ZERO, "quote should return nonzero output");
+
+    // Build V4 swap calldata
+    let zero_for_one = false;
+    let deadline = U256::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 300,
+    );
+    let calldata = basalt::universal_router::encode_v4_single(
+        &pool_info.pool_key,
+        zero_for_one,
+        amount_in.to::<u128>(),
+        0u128, // minAmountOut = 0 for test
+        deadline,
+    );
+
+    // Submit swap transaction
+    let result = basalt::executor::send_transaction(
+        &anvil.endpoint(),
+        &wallet,
+        basalt::executor::TransactionRequest {
+            to: router,
+            calldata: Bytes::from(calldata),
+            value: U256::ZERO,
+        },
+        120,
+    )
+    .await
+    .expect("V4 swap transaction should succeed on fork");
+
+    assert!(result.receipt.status(), "V4 swap transaction should not revert");
+    assert!(result.gas_used > 0, "gas should be consumed");
+
+    // Verify token balance is zero (all swapped)
+    let token_contract = IERC20::new(token, &provider);
+    let final_balance = token_contract.balanceOf(wallet.address).call().await.unwrap();
+    assert_eq!(final_balance, U256::ZERO, "all tokens should have been swapped");
+
+    // Verify we received some WETH
+    let weth_contract = IERC20::new(weth, &provider);
+    let weth_balance = weth_contract.balanceOf(wallet.address).call().await.unwrap();
+    assert!(weth_balance > U256::ZERO, "should have received WETH from V4 swap");
 }
 
